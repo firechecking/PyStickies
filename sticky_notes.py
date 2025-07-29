@@ -1,4 +1,4 @@
-import os, sys, json, traceback
+import os, sys, json, traceback, asyncio, aiohttp
 from datetime import datetime
 import markdown
 from PyQt5.QtWidgets import (
@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QColorDialog,
     QSystemTrayIcon,
     QTextBrowser,
+    QMessageBox,
 )
 from PyQt5.QtCore import (
     Qt,
@@ -26,6 +27,8 @@ from PyQt5.QtCore import (
     QSettings,
     pyqtSignal,
     QObject,
+    QThread,
+    pyqtSlot,
 )
 from PyQt5.QtGui import (
     QColor,
@@ -50,6 +53,126 @@ except ImportError:
     MACOS_AVAILABLE = False
 
 
+class GistWorker(QThread):
+    save_completed = pyqtSignal(bool, str)
+    load_completed = pyqtSignal(bool, str, dict)
+    
+    def __init__(self, github_token=None, gist_id=None):
+        super().__init__()
+        self.github_token = github_token
+        self.gist_id = gist_id
+        self.operation = None
+        self.data = None
+        self.filename = "pystickies_notes.json"
+        
+    def save_to_gist(self, data):
+        self.operation = "save"
+        self.data = data
+        self.start()
+        
+    def load_from_gist(self):
+        self.operation = "load"
+        self.start()
+        
+    def run(self):
+        if not self.github_token:
+            if self.operation == "save":
+                self.save_completed.emit(False, "GitHub token not configured")
+            else:
+                self.load_completed.emit(False, "GitHub token not configured", {})
+            return
+            
+        headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "PyStickies-App"
+        }
+        
+        try:
+            if self.operation == "save":
+                self._save_gist(headers)
+            elif self.operation == "load":
+                self._load_gist(headers)
+        except Exception as e:
+            error_msg = str(e)
+            if self.operation == "save":
+                self.save_completed.emit(False, error_msg)
+            else:
+                self.load_completed.emit(False, error_msg, {})
+    
+    def _save_gist(self, headers):
+        import aiohttp
+        import asyncio
+        
+        async def save_async():
+            async with aiohttp.ClientSession() as session:
+                files_data = {
+                    self.filename: {
+                        "content": json.dumps(self.data, ensure_ascii=False, indent=2)
+                    }
+                }
+                
+                gist_data = {
+                    "description": "PyStickies - Auto-synced notes",
+                    "files": files_data,
+                    "public": False
+                }
+                
+                if self.gist_id:
+                    # Update existing gist
+                    url = f"https://api.github.com/gists/{self.gist_id}"
+                    async with session.patch(url, headers=headers, json=gist_data) as resp:
+                        if resp.status == 200:
+                            self.save_completed.emit(True, "Notes synced to Gist")
+                        else:
+                            error_text = await resp.text()
+                            self.save_completed.emit(False, f"Failed to update gist: {resp.status} - {error_text}")
+                else:
+                    # Create new gist
+                    url = "https://api.github.com/gists"
+                    async with session.post(url, headers=headers, json=gist_data) as resp:
+                        if resp.status == 201:
+                            result = await resp.json()
+                            self.gist_id = result["id"]
+                            self.save_completed.emit(True, f"Created new gist: {self.gist_id}")
+                        else:
+                            error_text = await resp.text()
+                            self.save_completed.emit(False, f"Failed to create gist: {resp.status} - {error_text}")
+        
+        asyncio.run(save_async())
+    
+    def _load_gist(self, headers):
+        import aiohttp
+        import asyncio
+        
+        async def load_async():
+            if not self.gist_id:
+                self.load_completed.emit(False, "No gist ID configured", {})
+                return
+                
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.github.com/gists/{self.gist_id}"
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        if self.filename in result["files"]:
+                            content = result["files"][self.filename]["content"]
+                            try:
+                                notes_data = json.loads(content)
+                                self.load_completed.emit(True, "Notes loaded from Gist", notes_data)
+                            except json.JSONDecodeError as e:
+                                self.load_completed.emit(False, f"Invalid JSON in gist: {e}", {})
+                        else:
+                            self.load_completed.emit(False, f"File {self.filename} not found in gist", {})
+                    elif resp.status == 404:
+                        self.load_completed.emit(False, f"Gist {self.gist_id} not found", {})
+                    else:
+                        error_text = await resp.text()
+                        self.load_completed.emit(False, f"Failed to load gist: {resp.status} - {error_text}", {})
+        
+        asyncio.run(load_async())
+
+
 class StickyNoteManager(QObject):
     note_closed = pyqtSignal(str)
 
@@ -60,33 +183,106 @@ class StickyNoteManager(QObject):
         self.settings_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "notes_data.json"
         )
+        self.gist_config_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), ".gist_config"
+        )
+        
+        # Load Gist configuration
+        self.github_token = None
+        self.gist_id = None
+        self.load_gist_config()
+        
+        # Initialize Gist worker
+        self.gist_worker = GistWorker(self.github_token, self.gist_id)
+        self.gist_worker.save_completed.connect(self.on_gist_save_completed)
+        self.gist_worker.load_completed.connect(self.on_gist_load_completed)
+        
         self.load_notes()
 
-    def load_notes(self):
-        # 从JSON文件加载数据，而不是QSettings
-        notes_data = {}
+    def load_gist_config(self):
+        """Load Gist configuration from file or environment"""
+        # Try environment variables first
+        self.github_token = os.getenv('PYSTICKIES_GITHUB_TOKEN')
+        self.gist_id = os.getenv('PYSTICKIES_GIST_ID')
+        
+        # Try config file
+        if os.path.exists(self.gist_config_file):
+            try:
+                with open(self.gist_config_file, 'r') as f:
+                    config = json.load(f)
+                    self.github_token = config.get('github_token', self.github_token)
+                    self.gist_id = config.get('gist_id', self.gist_id)
+            except Exception as e:
+                print(f"Failed to load Gist config: {e}")
+        
+        # Update Gist worker with new credentials
+        if hasattr(self, 'gist_worker'):
+            self.gist_worker.github_token = self.github_token
+            self.gist_worker.gist_id = self.gist_id
+    
+    def save_gist_config(self):
+        """Save Gist configuration to file"""
+        config = {
+            'github_token': self.github_token,
+            'gist_id': self.gist_id
+        }
         try:
-            if os.path.exists(self.settings_file):
+            with open(self.gist_config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            # Update Gist worker
+            if hasattr(self, 'gist_worker'):
+                self.gist_worker.github_token = self.github_token
+                self.gist_worker.gist_id = self.gist_id
+        except Exception as e:
+            print(f"Failed to save Gist config: {e}")
+    
+    def load_notes(self):
+        """Load notes from local file or Gist (on first startup)"""
+        notes_data = {}
+        
+        # First, try to load from local file
+        local_file_exists = os.path.exists(self.settings_file)
+        if local_file_exists:
+            try:
                 with open(self.settings_file, "r", encoding="utf-8") as f:
                     notes_data = json.load(f)
-                print(f"Loaded {len(notes_data)} notes from {self.settings_file}")
-            else:
-                print("No saved notes found, starting fresh")
-        except Exception as e:
-            print(f"加载便签失败: {e}")
-            traceback.print_exc()
+                print(f"Loaded {len(notes_data)} notes from local file")
+            except Exception as e:
+                print(f"加载本地便签失败: {e}")
+                local_file_exists = False
+        
+        # If no local file and Gist is configured, try to load from Gist
+        if not local_file_exists and self.github_token and self.gist_id:
+            print("No local notes found, attempting to load from Gist...")
+            # Start async loading from Gist
+            self.gist_worker.load_from_gist()
+            return  # Exit early, notes will be loaded in callback
+        
+        # Load notes from local data (either from file or empty)
+        self._load_notes_from_data(notes_data)
+    
+    def _load_notes_from_data(self, notes_data):
+        """Internal method to load notes from data dict"""
         for note_id, note_data in notes_data.items():
-            note = self.display_note(
-                note_id=note_id,
-                content=note_data["content"],
-                position=QPoint(note_data["position"][0], note_data["position"][1]),
-                size=note_data["size"],
-                color=QColor(note_data.get("color", "#FFF9C4")),
-                opacity=note_data.get("opacity", 85),
-                screen_index=note_data.get("screen_index", None),
-            )
-            note.is_expanded = note_data.get("is_expanded", False)
-            note.edge_snapped = note_data.get("edge_snapped", None)
+            try:
+                note = self.display_note(
+                    note_id=note_id,
+                    content=note_data.get("content", ""),
+                    position=QPoint(note_data["position"][0], note_data["position"][1]),
+                    size=note_data["size"],
+                    color=QColor(note_data.get("color", "#FFF9C4")),
+                    opacity=note_data.get("opacity", 85),
+                    screen_index=note_data.get("screen_index", None),
+                )
+                note.is_expanded = note_data.get("is_expanded", False)
+                note.edge_snapped = note_data.get("edge_snapped", None)
+            except Exception as e:
+                print(f"Failed to load note {note_id}: {e}")
+        
+        # Create initial note if no notes loaded
+        if not self.notes:
+            print("No notes found, creating initial note")
+            self.create_new_note()
 
     def create_new_note(self):
         screens = QApplication.screens()
@@ -144,7 +340,7 @@ class StickyNoteManager(QObject):
         return note
 
     def save_notes(self):
-        """保存便签数据（按基础ID去重）"""
+        """保存便签数据到本地文件并异步同步到Gist"""
         notes_data = {}
         processed_base_ids = set()
 
@@ -182,19 +378,48 @@ class StickyNoteManager(QObject):
                     except Exception as e:
                         print(f"保存便签时出错: {e}")
 
-            # 直接写入JSON文件
+            # 保存到本地文件
             with open(self.settings_file, "w", encoding="utf-8") as f:
                 json.dump(notes_data, f, ensure_ascii=False, indent=2)
+
+            # 异步保存到Gist
+            if self.github_token:
+                self.gist_worker.save_to_gist(notes_data)
 
         except Exception as e:
             print(f"Critical file save error: {e}")
             traceback.print_exc()
 
+    @pyqtSlot(bool, str)
+    def on_gist_save_completed(self, success, message):
+        """Handle Gist save completion"""
+        if success:
+            print(f"Gist sync: {message}")
+        else:
+            print(f"Gist sync failed: {message}")
+
+    @pyqtSlot(bool, str, dict)
+    def on_gist_load_completed(self, success, message, notes_data):
+        """Handle Gist load completion"""
+        if success:
+            print(f"Gist load: {message}")
+            self._load_notes_from_data(notes_data)
+            # Save to local file after loading from Gist
+            with open(self.settings_file, "w", encoding="utf-8") as f:
+                json.dump(notes_data, f, ensure_ascii=False, indent=2)
+        else:
+            print(f"Gist load failed: {message}")
+            # Create initial note if failed to load from Gist
+            if not self.notes:
+                self.create_new_note()
+
     def close_note(self, note_id, save=True):
+        """直接删除便签（不显示确认对话框）"""
         if note_id in self.notes:
             del self.notes[note_id]
             if save:
                 self.save_notes()
+            print(f"Deleted note: {note_id}")
 
     def cleanup_and_exit(self):
         """程序退出前保存所有数据"""
@@ -213,11 +438,31 @@ class StickyNoteManager(QObject):
 
     def delete_all_notes(self):
         """删除所有便签"""
-        note_ids = list(self.notes.keys())
-        for note_id in note_ids:
-            self.notes[note_id].close()
-        self.notes.clear()
-        self.save_notes()
+        if not self.notes:
+            print("没有便签可以删除")
+            return
+
+        # 显示确认对话框
+        msg_box = QMessageBox()
+        msg_box.setWindowTitle("确认删除所有便签")
+        msg_box.setText(f"确定要删除所有 {len(self.notes)} 个便签吗？")
+        msg_box.setInformativeText("此操作不可撤销，所有便签内容将被永久删除。")
+        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg_box.setDefaultButton(QMessageBox.No)
+        msg_box.setIcon(QMessageBox.Warning)
+
+        result = msg_box.exec_()
+
+        if result == QMessageBox.Yes:
+            note_ids = list(self.notes.keys())
+            for note_id in note_ids:
+                if note_id in self.notes:  # 确保便签仍然存在
+                    self.notes[note_id].close()
+            self.notes.clear()
+            self.save_notes()
+            print("Deleted all notes")
+        else:
+            print("Deletion of all notes cancelled")
 
     def duplicate_note(self, source_note):
         """复制便签"""
@@ -700,6 +945,9 @@ class StickyNote(QMainWindow):
             for char in mini_content:
                 if ord(char) > 127:
                     width += 17
+                # 大写字母
+                elif char.isupper():
+                    width += 11
                 else:
                     width += 9
             return mini_content, width
@@ -910,8 +1158,28 @@ class StickyNote(QMainWindow):
         self.manager.save_notes()
 
     def closeEvent(self, event):
-        self.manager.close_note(self.note_id, save=False)
-        event.accept()
+        # 显示确认对话框
+        content_preview = (
+            self.get_content()[:50] + "..."
+            if len(self.get_content()) > 50
+            else self.get_content()
+        )
+
+        msg_box = QMessageBox()
+        msg_box.setWindowTitle("确认删除便签")
+        msg_box.setText("确定要删除这个便签吗？")
+        msg_box.setInformativeText(f"内容: {content_preview}")
+        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg_box.setDefaultButton(QMessageBox.No)
+        msg_box.setIcon(QMessageBox.Question)
+
+        result = msg_box.exec_()
+
+        if result == QMessageBox.Yes:
+            self.manager.close_note(self.note_id, save=True)  # 改为True以保存更改
+            event.accept()
+        else:
+            event.ignore()
 
 
 class SystemTrayIcon(QSystemTrayIcon):
