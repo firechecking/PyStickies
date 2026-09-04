@@ -1,0 +1,14 @@
+# 密钥配置（含 GitHub token，绝不入库）
+.gist_config
+
+# 便签数据（通过 Gist 同步，不入库）
+notes_data.json
+notes_data.json.bak
+
+# 运行时文件（日志、PID）
+*.log
+*.pid
+nohup.out
+
+# 工具缓存
+.codemap/

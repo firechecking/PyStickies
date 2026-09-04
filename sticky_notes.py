@@ -42,6 +42,13 @@ from PyQt5.QtGui import (
     QPixmap,
 )
 
+# 全局快捷键支持
+try:
+    from pynput import keyboard
+    GLOBAL_HOTKEYS_AVAILABLE = True
+except ImportError:
+    GLOBAL_HOTKEYS_AVAILABLE = False
+
 # macOS specific imports for all-desktop support
 try:
     import objc
@@ -197,6 +204,14 @@ class StickyNoteManager(QObject):
         self.gist_worker.save_completed.connect(self.on_gist_save_completed)
         self.gist_worker.load_completed.connect(self.on_gist_load_completed)
         
+        # 初始化全局快捷键
+        self.global_hotkey_manager = GlobalHotkeyManager(self)
+        
+        # 不再自动同步，改为手动同步
+        # self.sync_timer = QTimer()
+        # self.sync_timer.timeout.connect(self.sync_from_gist)
+        # self.sync_timer.start(60000)  # 注释掉自动同步
+        
         self.load_notes()
 
     def load_gist_config(self):
@@ -235,12 +250,24 @@ class StickyNoteManager(QObject):
                 self.gist_worker.gist_id = self.gist_id
         except Exception as e:
             print(f"Failed to save Gist config: {e}")
+
+    def sync_from_gist(self):
+        """Automatically sync notes from Gist every minute"""
+        if not self.github_token or not self.gist_id:
+            print("Skipping Gist sync - GitHub token or Gist ID not configured")
+            return
+            
+        print("Starting automatic sync from Gist...")
+        try:
+            self.gist_worker.load_from_gist()
+        except Exception as e:
+            print(f"Failed to start Gist sync: {e}")
     
     def load_notes(self):
-        """Load notes from local file or Gist (on first startup)"""
+        """Always load layout from local file, sync content from Gist separately"""
         notes_data = {}
         
-        # First, try to load from local file
+        # 总是先加载本地文件（包含布局信息）
         local_file_exists = os.path.exists(self.settings_file)
         if local_file_exists:
             try:
@@ -249,38 +276,136 @@ class StickyNoteManager(QObject):
                 print(f"Loaded {len(notes_data)} notes from local file")
             except Exception as e:
                 print(f"加载本地便签失败: {e}")
-                local_file_exists = False
         
-        # If no local file and Gist is configured, try to load from Gist
-        if not local_file_exists and self.github_token and self.gist_id:
-            print("No local notes found, attempting to load from Gist...")
-            # Start async loading from Gist
-            self.gist_worker.load_from_gist()
-            return  # Exit early, notes will be loaded in callback
-        
-        # Load notes from local data (either from file or empty)
+        # 加载本地数据（包含完整布局信息）
         self._load_notes_from_data(notes_data)
+        
+        # 异步从Gist同步内容（不影响布局）
+        if self.github_token and self.gist_id:
+            print("Starting background content sync from Gist...")
+            self.gist_worker.load_from_gist()
     
+    def _validate_screen_position(self, position, size, screen_index):
+        """保持原始位置和尺寸，不做调整"""
+        return position, screen_index, size
+
     def _load_notes_from_data(self, notes_data):
-        """Internal method to load notes from data dict"""
+        """Internal method to load notes from data dict - 支持新旧格式和Gist数据"""
+        if not notes_data:
+            return
+            
+        # 完全清除现有便签，重新加载
+        existing_notes = list(self.notes.keys())
+        for note_id in existing_notes:
+            if note_id in self.notes:
+                self.notes[note_id].close_without_confirmation()
+                if note_id in self.notes:
+                    del self.notes[note_id]
+        
+        # 处理新旧数据格式和Gist数据格式
         for note_id, note_data in notes_data.items():
             try:
+                # 检查是新格式（有stable_data和layout_data）还是旧格式或Gist格式
+                if "stable_data" in note_data and "layout_data" in note_data:
+                    # 新格式（完整格式）
+                    stable_data = note_data["stable_data"]
+                    layout_data = note_data["layout_data"]
+                    
+                    content = stable_data.get("content", "")
+                    color = QColor(stable_data.get("color", "#FFF9C4"))
+                    opacity = stable_data.get("opacity", 85)
+                    
+                    position = QPoint(layout_data["position"][0], layout_data["position"][1])
+                    size = layout_data["size"]
+                    screen_index = layout_data.get("screen_index", 0)
+                    is_expanded = layout_data.get("is_expanded", False)
+                    edge_snapped = layout_data.get("edge_snapped", None)
+                    
+                elif "stable_data" in note_data:
+                    # Gist格式（只有stable_data）或简化的稳定数据
+                    stable_data = note_data["stable_data"]
+                    
+                    content = stable_data.get("content", "")
+                    color = QColor(stable_data.get("color", "#FFF9C4"))
+                    opacity = stable_data.get("opacity", 85)
+                    
+                    # 为缺失的布局数据提供默认值
+                    screens = QApplication.screens()
+                    current_screen = QApplication.screenAt(QCursor.pos())
+                    screen_index = screens.index(current_screen) if current_screen else 0
+                    screen_geo = screens[screen_index].geometry()
+                    
+                    position = QPoint(screen_geo.x() + 100, screen_geo.y() + 100)
+                    size = [300, 200]  # 默认大小
+                    is_expanded = True
+                    edge_snapped = None
+                    
+                elif "content" in note_data and "position" in note_data:
+                    # 旧格式
+                    content = note_data.get("content", "")
+                    color = QColor(note_data.get("color", "#FFF9C4"))
+                    opacity = note_data.get("opacity", 85)
+                    
+                    position = QPoint(note_data["position"][0], note_data["position"][1])
+                    size = note_data["size"]
+                    screen_index = note_data.get("screen_index", 0)
+                    is_expanded = note_data.get("is_expanded", False)
+                    edge_snapped = note_data.get("edge_snapped", None)
+                
+                else:
+                    # 最简格式（只有内容）
+                    content = str(note_data) if isinstance(note_data, str) else ""
+                    color = QColor("#FFF9C4")
+                    opacity = 85
+                    
+                    # 提供默认布局数据
+                    screens = QApplication.screens()
+                    current_screen = QApplication.screenAt(QCursor.pos())
+                    screen_index = screens.index(current_screen) if current_screen else 0
+                    screen_geo = screens[screen_index].geometry()
+                    
+                    position = QPoint(screen_geo.x() + 100, screen_geo.y() + 100)
+                    size = [300, 200]
+                    is_expanded = True
+                    edge_snapped = None
+                
+                # 创建新便签，但不触发任何事件
                 note = self.display_note(
                     note_id=note_id,
-                    content=note_data.get("content", ""),
-                    position=QPoint(note_data["position"][0], note_data["position"][1]),
-                    size=note_data["size"],
-                    color=QColor(note_data.get("color", "#FFF9C4")),
-                    opacity=note_data.get("opacity", 85),
-                    screen_index=note_data.get("screen_index", None),
+                    content=content,
+                    position=position,
+                    size=size,
+                    color=color,
+                    opacity=opacity,
+                    screen_index=screen_index,
                 )
-                note.is_expanded = note_data.get("is_expanded", False)
-                note.edge_snapped = note_data.get("edge_snapped", None)
+                note.is_expanded = is_expanded
+                note.edge_snapped = edge_snapped
+                
             except Exception as e:
                 print(f"Failed to load note {note_id}: {e}")
+                # 如果解析失败，创建带有默认值的便签
+                try:
+                    screens = QApplication.screens()
+                    current_screen = QApplication.screenAt(QCursor.pos())
+                    screen_index = screens.index(current_screen) if current_screen else 0
+                    screen_geo = screens[screen_index].geometry()
+                    
+                    note = self.display_note(
+                        note_id=note_id,
+                        content=str(note_data)[:100] + "..." if len(str(note_data)) > 100 else str(note_data),
+                        position=QPoint(screen_geo.x() + 100, screen_geo.y() + 100),
+                        size=[300, 200],
+                        color=QColor("#FFF9C4"),
+                        opacity=85,
+                        screen_index=screen_index,
+                    )
+                    self.notes[note_id] = note
+                except Exception as e2:
+                    print(f"Critical error creating fallback note: {e2}")
         
-        # Create initial note if no notes loaded
-        if not self.notes:
+        # 只在完全没有便签时创建初始便签
+        if not self.notes and not notes_data:
             print("No notes found, creating initial note")
             self.create_new_note()
 
@@ -361,18 +486,22 @@ class StickyNoteManager(QObject):
                         rel_y = note.y() - screen_geo.y()
 
                         notes_data[base_id] = {
-                            "content": str(note.get_content() or ""),
-                            "position": [int(rel_x), int(rel_y)],
-                            "size": [int(note.width()), int(note.height())],
-                            "color": str(note.color.name() or "#FFF9C4"),
-                            "opacity": int(note.opacity_slider.value() or 85),
-                            "screen_index": int(screen_index),
-                            "is_expanded": bool(note.is_expanded),
-                            "edge_snapped": (
-                                str(note.edge_snapped)
-                                if note.edge_snapped is not None
-                                else None
-                            ),
+                            "stable_data": {
+                                "content": str(note.get_content() or ""),
+                                "color": str(note.color.name() or "#FFF9C4"),
+                                "opacity": int(note.opacity_slider.value() or 85),
+                            },
+                            "layout_data": {
+                                "position": [int(rel_x), int(rel_y)],
+                                "size": [int(note.width()), int(note.height())],
+                                "screen_index": int(screen_index),
+                                "is_expanded": bool(note.is_expanded),
+                                "edge_snapped": (
+                                    str(note.edge_snapped)
+                                    if note.edge_snapped is not None
+                                    else None
+                                ),
+                            }
                         }
                         processed_base_ids.add(base_id)
                     except Exception as e:
@@ -382,9 +511,13 @@ class StickyNoteManager(QObject):
             with open(self.settings_file, "w", encoding="utf-8") as f:
                 json.dump(notes_data, f, ensure_ascii=False, indent=2)
 
-            # 异步保存到Gist
+            # 异步保存到Gist - 只包含稳定数据（内容、颜色、透明度）
             if self.github_token:
-                self.gist_worker.save_to_gist(notes_data)
+                gist_data = {}
+                for note_id, data in notes_data.items():
+                    # 只同步内容数据，不包含布局数据
+                    gist_data[note_id] = {"stable_data": data["stable_data"]}
+                self.gist_worker.save_to_gist(gist_data)
 
         except Exception as e:
             print(f"Critical file save error: {e}")
@@ -400,18 +533,96 @@ class StickyNoteManager(QObject):
 
     @pyqtSlot(bool, str, dict)
     def on_gist_load_completed(self, success, message, notes_data):
-        """Handle Gist load completion"""
+        """Handle Gist load completion - update content only, never touch layout"""
         if success:
             print(f"Gist load: {message}")
-            self._load_notes_from_data(notes_data)
-            # Save to local file after loading from Gist
-            with open(self.settings_file, "w", encoding="utf-8") as f:
-                json.dump(notes_data, f, ensure_ascii=False, indent=2)
+            # 只更新内容，绝不改变位置或大小
+            self._loading = True
+            try:
+                # 加载本地完整数据（包含布局信息）
+                local_data = {}
+                if os.path.exists(self.settings_file):
+                    try:
+                        with open(self.settings_file, "r", encoding="utf-8") as f:
+                            local_data = json.load(f)
+                    except Exception as e:
+                        print(f"Failed to load local data: {e}")
+                
+                # 处理每个从Gist加载的便签
+                for note_id, gist_note_data in notes_data.items():
+                    stable_data = gist_note_data.get("stable_data", {})
+                    content = stable_data.get("content", "")
+                    color = QColor(stable_data.get("color", "#FFF9C4"))
+                    opacity = stable_data.get("opacity", 85)
+                    
+                    if note_id in self.notes:
+                        # 更新现有便签的内容，完全不改变位置
+                        note = self.notes[note_id]
+                        old_auto_save = note.text_edit.blockSignals(True)
+                        try:
+                            note.set_content(content, replace=True)
+                            note.set_color(color)
+                            note.set_opacity(opacity)
+                        finally:
+                            note.text_edit.blockSignals(old_auto_save)
+                    else:
+                        # 新便签，使用本地布局数据（绝对优先）或默认位置
+                        position = None
+                        size = None
+                        screen_index = 0
+                        is_expanded = True
+                        edge_snapped = None
+                        
+                        # 绝对优先使用本地布局数据
+                        if note_id in local_data:
+                            local_note_data = local_data[note_id]
+                            if "layout_data" in local_note_data:
+                                layout_data = local_note_data["layout_data"]
+                                position = QPoint(layout_data["position"][0], layout_data["position"][1])
+                                size = layout_data["size"]
+                                screen_index = layout_data.get("screen_index", 0)
+                                is_expanded = layout_data.get("is_expanded", True)
+                                edge_snapped = layout_data.get("edge_snapped", None)
+                            elif "position" in local_note_data and "size" in local_note_data:
+                                # 旧格式
+                                position = QPoint(local_note_data["position"][0], local_note_data["position"][1])
+                                size = local_note_data["size"]
+                                screen_index = local_note_data.get("screen_index", 0)
+                                is_expanded = local_note_data.get("is_expanded", True)
+                                edge_snapped = local_note_data.get("edge_snapped", None)
+                        
+                        # 只有真正的新便签才使用默认位置
+                        if position is None:
+                            screens = QApplication.screens()
+                            current_screen = QApplication.screenAt(QCursor.pos())
+                            screen_index = screens.index(current_screen) if current_screen else 0
+                            screen_geo = screens[screen_index].geometry()
+                            position = QPoint(screen_geo.x() + 100, screen_geo.y() + 100)
+                            size = [300, 200]
+                        
+                        # 创建新便签
+                        note = self.display_note(
+                            note_id=note_id,
+                            content=content,
+                            position=position,
+                            size=size,
+                            color=color,
+                            opacity=opacity,
+                            screen_index=screen_index,
+                        )
+                        note.is_expanded = is_expanded
+                        note.edge_snapped = edge_snapped
+                
+                # 保存当前完整状态（内容+布局）
+                self.save_notes()
+                    
+            finally:
+                self._loading = False
         else:
             print(f"Gist load failed: {message}")
-            # Create initial note if failed to load from Gist
+            # 如果Gist加载失败，正常加载本地数据
             if not self.notes:
-                self.create_new_note()
+                self.load_notes()
 
     def close_note(self, note_id, save=True):
         """直接删除便签（不显示确认对话框）"""
@@ -422,7 +633,11 @@ class StickyNoteManager(QObject):
             print(f"Deleted note: {note_id}")
 
     def cleanup_and_exit(self):
-        """程序退出前保存所有数据"""
+        """程序退出前保存所有数据并清理资源"""
+        # 清理全局快捷键
+        if hasattr(self, 'global_hotkey_manager'):
+            self.global_hotkey_manager.cleanup()
+        
         self.save_notes()
         print("Data saved before exit")
 
@@ -737,6 +952,18 @@ class StickyNote(QMainWindow):
         duplicate_action.triggered.connect(lambda: self.manager.duplicate_note(self))
         menu.addAction(duplicate_action)
 
+        # 添加手动同步功能
+        sync_action = QAction("同步到Gist", menu)
+        sync_action.triggered.connect(lambda: self.manager.save_notes())
+        menu.addAction(sync_action)
+
+        # 添加从Gist加载功能
+        load_action = QAction("从Gist加载", menu)
+        load_action.triggered.connect(lambda: self.manager.sync_from_gist())
+        menu.addAction(load_action)
+
+        menu.addSeparator()
+
         delete_action = QAction("删除便签", menu)
         delete_action.triggered.connect(self.close)
         menu.addAction(delete_action)
@@ -931,26 +1158,24 @@ class StickyNote(QMainWindow):
         screen_geo = screen.geometry()
         current_geo = self.geometry()
 
-        # 还原最初样式：缩小后就是小长条，不显示文字
+        # 收缩状态下显示第一行，保留标签符号
         def mini_content(content):
-            mini_content = content.split("\n")[0]
-            while True:
-                for char in ("#", "-", "*", " ", "\n", "\t"):
-                    if mini_content.startswith(char):
-                        mini_content = mini_content.strip(char)
-                        break
-                else:
-                    break
+            # 获取第一行，但保留markdown标签
+            first_line = content.split("\n")[0] if content else ""
+            if not first_line.strip():
+                first_line = "新便签"
+            
+            # 计算宽度，保留原始标签
+            display_text = first_line.strip()
             width = 0
-            for char in mini_content:
+            for char in display_text:
                 if ord(char) > 127:
                     width += 17
-                # 大写字母
                 elif char.isupper():
                     width += 11
                 else:
                     width += 9
-            return mini_content, width
+            return display_text, width
 
         new_content, new_width = mini_content(self.full_content)
         self.set_content(new_content)
@@ -1151,11 +1376,18 @@ class StickyNote(QMainWindow):
 
     def moveEvent(self, event):
         super().moveEvent(event)
-        self.manager.save_notes()
+        if not self.manager._loading:
+            self.manager.save_notes()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.manager.save_notes()
+        if not self.manager._loading:
+            self.manager.save_notes()
+
+    def close_without_confirmation(self):
+        """直接关闭便签，不显示确认窗口"""
+        self.manager.close_note(self.note_id, save=True)
+        self.close()
 
     def closeEvent(self, event):
         # 显示确认对话框
@@ -1180,6 +1412,65 @@ class StickyNote(QMainWindow):
             event.accept()
         else:
             event.ignore()
+
+
+class GlobalHotkeyManager(QObject):
+    """全局快捷键管理器"""
+    
+    def __init__(self, manager):
+        super().__init__()
+        self.manager = manager
+        self.hotkey_listener = None
+        self.is_hidden = False
+        
+        if GLOBAL_HOTKEYS_AVAILABLE:
+            try:
+                self.setup_global_hotkeys()
+                print("全局快捷键已启用 (Ctrl+Shift+H)")
+            except Exception as e:
+                print(f"全局快捷键初始化失败: {e}")
+                print("请安装 pynput: pip install pynput")
+        else:
+            print("全局快捷键不可用，请安装 pynput: pip install pynput")
+    
+    def setup_global_hotkeys(self):
+        """设置全局快捷键"""
+        def on_hotkey():
+            # 使用Qt的线程安全方式调用
+            QTimer.singleShot(0, self.toggle_all_notes)
+        
+        # 定义快捷键组合：Ctrl+Shift+H
+        hotkey = keyboard.HotKey(
+            keyboard.HotKey.parse('<ctrl>+<shift>+h'),
+            on_hotkey
+        )
+        
+        def for_canonical(f):
+            return lambda k: f(listener.canonical(k))
+        
+        listener = keyboard.Listener(
+            on_press=for_canonical(hotkey.press),
+            on_release=for_canonical(hotkey.release)
+        )
+        
+        self.hotkey_listener = listener
+        listener.start()
+    
+    def toggle_all_notes(self):
+        """切换显示/隐藏所有便签"""
+        if self.is_hidden:
+            self.manager.show_all_notes()
+            self.is_hidden = False
+            print("显示所有便签")
+        else:
+            self.manager.hide_all_notes()
+            self.is_hidden = True
+            print("隐藏所有便签")
+    
+    def cleanup(self):
+        """清理资源"""
+        if self.hotkey_listener:
+            self.hotkey_listener.stop()
 
 
 class SystemTrayIcon(QSystemTrayIcon):
@@ -1239,6 +1530,19 @@ class SystemTrayIcon(QSystemTrayIcon):
         topmost_action.triggered.connect(self.toggle_always_on_top)
         menu.addAction(topmost_action)
 
+        menu.addSeparator()
+
+        # 添加手动同步功能
+        sync_action = QAction("同步到Gist", menu)
+        sync_action.triggered.connect(self.manager.save_notes)
+        menu.addAction(sync_action)
+
+        load_action = QAction("从Gist加载", menu)
+        load_action.triggered.connect(self.manager.sync_from_gist)
+        menu.addAction(load_action)
+
+        menu.addSeparator()
+
         delete_action = QAction("删除全部", menu)
         delete_action.triggered.connect(self.manager.delete_all_notes)
         menu.addAction(delete_action)
@@ -1256,8 +1560,12 @@ class SystemTrayIcon(QSystemTrayIcon):
         self.setVisible(True)
 
         # 显示提示，告诉用户如何使用
+        hotkey_msg = " (Ctrl+Shift+H 切换显示/隐藏)" if GLOBAL_HOTKEYS_AVAILABLE else ""
         self.showMessage(
-            "PyStickies", "右键点击托盘图标新建便签", QSystemTrayIcon.Information, 3000
+            "PyStickies", 
+            f"右键点击托盘图标新建便签{hotkey_msg}", 
+            QSystemTrayIcon.Information, 
+            3000
         )
 
     def on_tray_activated(self, reason):
@@ -1289,7 +1597,7 @@ def main():
         manager.create_new_note()
 
     # 确保程序退出时保存数据
-    # app.aboutToQuit.connect(manager.cleanup_and_exit)
+    app.aboutToQuit.connect(manager.cleanup_and_exit)
 
     sys.exit(app.exec_())
 
