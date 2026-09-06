@@ -5,10 +5,16 @@
 notes_data.json
 notes_data.json.bak
 
-# 运行时文件（日志、PID）
+# 运行时文件（日志、PID、锁）
 *.log
 *.pid
+*.lock
 nohup.out
+notes_data.json.tmp
+
+# 导出的便签
+pystickies_export_*.md
 
 # 工具缓存
 .codemap/
+__pycache__/

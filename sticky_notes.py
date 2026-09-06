@@ -1,5 +1,6 @@
-import os, sys, json, traceback, asyncio, aiohttp
+import os, sys, json, traceback, signal, shutil, fcntl, urllib.request, urllib.error
 from datetime import datetime
+from ctypes import c_void_p
 import markdown
 from PyQt5.QtWidgets import (
     QApplication,
@@ -17,6 +18,8 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon,
     QTextBrowser,
     QMessageBox,
+    QSizeGrip,
+    QGraphicsDropShadowEffect,
 )
 from PyQt5.QtCore import (
     Qt,
@@ -25,6 +28,8 @@ from PyQt5.QtCore import (
     QRect,
     QPoint,
     QSettings,
+    QEvent,
+    QEasingCurve,
     pyqtSignal,
     QObject,
     QThread,
@@ -40,6 +45,8 @@ from PyQt5.QtGui import (
     QKeySequence,
     QScreen,
     QPixmap,
+    QPainter,
+    QPen,
 )
 
 # 全局快捷键支持
@@ -52,7 +59,7 @@ except ImportError:
 # macOS specific imports for all-desktop support
 try:
     import objc
-    from AppKit import NSStatusWindowLevel, NSFloatingWindowLevel
+    from AppKit import NSStatusWindowLevel, NSFloatingWindowLevel, NSApplicationActivationPolicyAccessory
     from Cocoa import NSApplication, NSApp, NSWindowCollectionBehaviorCanJoinAllSpaces
 
     MACOS_AVAILABLE = True
@@ -60,124 +67,186 @@ except ImportError:
     MACOS_AVAILABLE = False
 
 
+# 便签预设色卡（最后一个为深色，用于暗色适配）
+PRESET_COLORS = ["#FFF9C4", "#FFD1DC", "#C8E6C9", "#BBDEFB", "#E1BEE7", "#FFE0B2", "#4A4A4A"]
+
+# 窗口四周的恒定边距（阴影空间）。吸附时窗口探出屏幕外 CHROME_MARGIN 像素，
+# 让卡片始终贴合屏幕边缘——吸附/拖出时卡片尺寸因此完全一致，不会突变
+CHROME_MARGIN = 12
+
+
+def make_icon(kind, color=None, size=16):
+    """自绘矢量图标：风格统一，替代 emoji（不同系统渲染不一致）"""
+    if color is None:
+        color = QColor("#444")
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(QPen(color, 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+
+    if kind == "preview":  # 眼睛：进入预览
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(1, 4, size - 2, size - 8)
+        painter.setBrush(color)
+        painter.drawEllipse(size // 2 - 2, size // 2 - 2, 4, 4)
+    elif kind == "edit":  # 铅笔：返回编辑
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(3, size - 3, size - 7, 6)
+        painter.drawLine(size - 7, 6, size - 3, 2)
+    elif kind == "palette":  # 调色盘：换颜色
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(2, 2, size - 4, size - 4)
+        painter.setBrush(color)
+        painter.drawEllipse(5, 5, 3, 3)
+        painter.drawEllipse(size - 8, 5, 3, 3)
+        painter.drawEllipse(size // 2 - 1, size - 8, 3, 3)
+    elif kind == "opacity":  # 半满圆：透明度
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(2, 2, size - 4, size - 4)
+        painter.setBrush(color)
+        painter.drawPie(2, 2, size - 4, size - 4, -90 * 16, 180 * 16)
+    elif kind == "close":  # 叉：关闭
+        painter.drawLine(4, 4, size - 4, size - 4)
+        painter.drawLine(size - 4, 4, 4, size - 4)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
 class GistWorker(QThread):
+    """Gist 同步线程：请求排队后串行处理，避免并发写冲突"""
+
     save_completed = pyqtSignal(bool, str)
     load_completed = pyqtSignal(bool, str, dict)
-    
+
     def __init__(self, github_token=None, gist_id=None):
         super().__init__()
         self.github_token = github_token
         self.gist_id = gist_id
-        self.operation = None
-        self.data = None
         self.filename = "pystickies_notes.json"
-        
+        self.base_url = "https://api.github.com"
+        # 由 manager 在发起加载前设置，用于跳过无变化的远端
+        self.last_known_updated_at = None
+        # 最近一次成功请求后远端返回的 updated_at
+        self.updated_at = None
+        self._pending_save = None
+        self._pending_load = False
+
     def save_to_gist(self, data):
-        self.operation = "save"
-        self.data = data
-        self.start()
-        
+        # 线程运行中只记录最新数据，由 run 循环接着处理
+        self._pending_save = data
+        if not self.isRunning():
+            self.start()
+
     def load_from_gist(self):
-        self.operation = "load"
-        self.start()
-        
+        self._pending_load = True
+        if not self.isRunning():
+            self.start()
+
     def run(self):
         if not self.github_token:
-            if self.operation == "save":
+            if self._pending_save is not None:
+                self._pending_save = None
                 self.save_completed.emit(False, "GitHub token not configured")
-            else:
+            if self._pending_load:
+                self._pending_load = False
                 self.load_completed.emit(False, "GitHub token not configured", {})
             return
-            
+
         headers = {
             "Authorization": f"token {self.github_token}",
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "PyStickies-App"
+            "User-Agent": "PyStickies-App",
         }
-        
-        try:
-            if self.operation == "save":
-                self._save_gist(headers)
-            elif self.operation == "load":
-                self._load_gist(headers)
-        except Exception as e:
-            error_msg = str(e)
-            if self.operation == "save":
-                self.save_completed.emit(False, error_msg)
+
+        # 串行处理：运行期间新到的请求在循环里继续消化
+        while True:
+            if self._pending_load:
+                self._pending_load = False
+                try:
+                    self._load_gist(headers)
+                except Exception as e:
+                    self.load_completed.emit(False, str(e), {})
+            elif self._pending_save is not None:
+                data = self._pending_save
+                self._pending_save = None
+                try:
+                    self._save_gist(headers, data)
+                except Exception as e:
+                    self.save_completed.emit(False, str(e))
             else:
-                self.load_completed.emit(False, error_msg, {})
-    
-    def _save_gist(self, headers):
-        import aiohttp
-        import asyncio
-        
-        async def save_async():
-            async with aiohttp.ClientSession() as session:
-                files_data = {
-                    self.filename: {
-                        "content": json.dumps(self.data, ensure_ascii=False, indent=2)
-                    }
+                break
+
+    def _request(self, method, url, headers, payload=None):
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def _save_gist(self, headers, data):
+        gist_data = {
+            "description": "PyStickies - Auto-synced notes",
+            "files": {
+                self.filename: {
+                    "content": json.dumps(data, ensure_ascii=False, indent=2)
                 }
-                
-                gist_data = {
-                    "description": "PyStickies - Auto-synced notes",
-                    "files": files_data,
-                    "public": False
-                }
-                
-                if self.gist_id:
-                    # Update existing gist
-                    url = f"https://api.github.com/gists/{self.gist_id}"
-                    async with session.patch(url, headers=headers, json=gist_data) as resp:
-                        if resp.status == 200:
-                            self.save_completed.emit(True, "Notes synced to Gist")
-                        else:
-                            error_text = await resp.text()
-                            self.save_completed.emit(False, f"Failed to update gist: {resp.status} - {error_text}")
-                else:
-                    # Create new gist
-                    url = "https://api.github.com/gists"
-                    async with session.post(url, headers=headers, json=gist_data) as resp:
-                        if resp.status == 201:
-                            result = await resp.json()
-                            self.gist_id = result["id"]
-                            self.save_completed.emit(True, f"Created new gist: {self.gist_id}")
-                        else:
-                            error_text = await resp.text()
-                            self.save_completed.emit(False, f"Failed to create gist: {resp.status} - {error_text}")
-        
-        asyncio.run(save_async())
-    
+            },
+            "public": False,
+        }
+
+        if self.gist_id:
+            # Update existing gist
+            url = f"{self.base_url}/gists/{self.gist_id}"
+            status, body = self._request("PATCH", url, headers, gist_data)
+            if status == 200:
+                self.updated_at = json.loads(body).get("updated_at")
+                self.save_completed.emit(True, "Notes synced to Gist")
+            else:
+                self.save_completed.emit(False, f"Failed to update gist: {status} - {body.decode('utf-8', 'replace')}")
+        else:
+            # Create new gist
+            url = f"{self.base_url}/gists"
+            status, body = self._request("POST", url, headers, gist_data)
+            if status == 201:
+                result = json.loads(body)
+                self.gist_id = result["id"]
+                self.updated_at = result.get("updated_at")
+                self.save_completed.emit(True, f"Created new gist: {self.gist_id}")
+            else:
+                self.save_completed.emit(False, f"Failed to create gist: {status} - {body.decode('utf-8', 'replace')}")
+
     def _load_gist(self, headers):
-        import aiohttp
-        import asyncio
-        
-        async def load_async():
-            if not self.gist_id:
-                self.load_completed.emit(False, "No gist ID configured", {})
+        if not self.gist_id:
+            self.load_completed.emit(False, "No gist ID configured", {})
+            return
+
+        url = f"{self.base_url}/gists/{self.gist_id}"
+        status, body = self._request("GET", url, headers)
+        if status == 200:
+            result = json.loads(body)
+            remote_updated_at = result.get("updated_at")
+            # 远端无变化时跳过，避免覆盖本地未推送的编辑
+            if remote_updated_at == self.last_known_updated_at:
+                self.load_completed.emit(True, "Gist 无更新，跳过加载", {})
                 return
-                
-            async with aiohttp.ClientSession() as session:
-                url = f"https://api.github.com/gists/{self.gist_id}"
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        result = await resp.json()
-                        if self.filename in result["files"]:
-                            content = result["files"][self.filename]["content"]
-                            try:
-                                notes_data = json.loads(content)
-                                self.load_completed.emit(True, "Notes loaded from Gist", notes_data)
-                            except json.JSONDecodeError as e:
-                                self.load_completed.emit(False, f"Invalid JSON in gist: {e}", {})
-                        else:
-                            self.load_completed.emit(False, f"File {self.filename} not found in gist", {})
-                    elif resp.status == 404:
-                        self.load_completed.emit(False, f"Gist {self.gist_id} not found", {})
-                    else:
-                        error_text = await resp.text()
-                        self.load_completed.emit(False, f"Failed to load gist: {resp.status} - {error_text}", {})
-        
-        asyncio.run(load_async())
+            if self.filename in result["files"]:
+                content = result["files"][self.filename]["content"]
+                try:
+                    notes_data = json.loads(content)
+                    self.updated_at = remote_updated_at
+                    self.load_completed.emit(True, "Notes loaded from Gist", notes_data)
+                except json.JSONDecodeError as e:
+                    self.load_completed.emit(False, f"Invalid JSON in gist: {e}", {})
+            else:
+                self.load_completed.emit(False, f"File {self.filename} not found in gist", {})
+        elif status == 404:
+            self.load_completed.emit(False, f"Gist {self.gist_id} not found", {})
+        else:
+            self.load_completed.emit(False, f"Failed to load gist: {status} - {body.decode('utf-8', 'replace')}", {})
 
 
 class StickyNoteManager(QObject):
@@ -197,13 +266,32 @@ class StickyNoteManager(QObject):
         # Load Gist configuration
         self.github_token = None
         self.gist_id = None
+        self.gist_updated_at = None
         self.load_gist_config()
-        
+
         # Initialize Gist worker
         self.gist_worker = GistWorker(self.github_token, self.gist_id)
         self.gist_worker.save_completed.connect(self.on_gist_save_completed)
         self.gist_worker.load_completed.connect(self.on_gist_load_completed)
-        
+
+        # 本地保存防抖（500ms）：避免拖动/输入时频繁写文件
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(500)
+        self.save_timer.timeout.connect(self._save_notes_now)
+
+        # Gist 同步防抖（5s）：停止编辑后再推送，避免触发 API 限流
+        self.gist_sync_timer = QTimer(self)
+        self.gist_sync_timer.setSingleShot(True)
+        self.gist_sync_timer.setInterval(5000)
+        self.gist_sync_timer.timeout.connect(self._sync_to_gist_now)
+
+        # 统一轮询所有便签的边缘吸附与悬停展开（替代每个便签各自的定时器）
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(60)
+        self.poll_timer.timeout.connect(self._poll_notes)
+        self.poll_timer.start()
+
         # 初始化全局快捷键
         self.global_hotkey_manager = GlobalHotkeyManager(self)
         
@@ -219,7 +307,7 @@ class StickyNoteManager(QObject):
         # Try environment variables first
         self.github_token = os.getenv('PYSTICKIES_GITHUB_TOKEN')
         self.gist_id = os.getenv('PYSTICKIES_GIST_ID')
-        
+
         # Try config file
         if os.path.exists(self.gist_config_file):
             try:
@@ -227,19 +315,21 @@ class StickyNoteManager(QObject):
                     config = json.load(f)
                     self.github_token = config.get('github_token', self.github_token)
                     self.gist_id = config.get('gist_id', self.gist_id)
+                    self.gist_updated_at = config.get('gist_updated_at', self.gist_updated_at)
             except Exception as e:
                 print(f"Failed to load Gist config: {e}")
-        
+
         # Update Gist worker with new credentials
         if hasattr(self, 'gist_worker'):
             self.gist_worker.github_token = self.github_token
             self.gist_worker.gist_id = self.gist_id
-    
+
     def save_gist_config(self):
         """Save Gist configuration to file"""
         config = {
             'github_token': self.github_token,
-            'gist_id': self.gist_id
+            'gist_id': self.gist_id,
+            'gist_updated_at': self.gist_updated_at
         }
         try:
             with open(self.gist_config_file, 'w') as f:
@@ -252,16 +342,14 @@ class StickyNoteManager(QObject):
             print(f"Failed to save Gist config: {e}")
 
     def sync_from_gist(self):
-        """Automatically sync notes from Gist every minute"""
+        """从 Gist 加载便签内容（远端无变化时自动跳过）"""
         if not self.github_token or not self.gist_id:
             print("Skipping Gist sync - GitHub token or Gist ID not configured")
             return
-            
-        print("Starting automatic sync from Gist...")
-        try:
-            self.gist_worker.load_from_gist()
-        except Exception as e:
-            print(f"Failed to start Gist sync: {e}")
+
+        print("Starting sync from Gist...")
+        self.gist_worker.last_known_updated_at = self.gist_updated_at
+        self.gist_worker.load_from_gist()
     
     def load_notes(self):
         """Always load layout from local file, sync content from Gist separately"""
@@ -283,6 +371,7 @@ class StickyNoteManager(QObject):
         # 异步从Gist同步内容（不影响布局）
         if self.github_token and self.gist_id:
             print("Starting background content sync from Gist...")
+            self.gist_worker.last_known_updated_at = self.gist_updated_at
             self.gist_worker.load_from_gist()
     
     def _validate_screen_position(self, position, size, screen_index):
@@ -314,7 +403,8 @@ class StickyNoteManager(QObject):
                     content = stable_data.get("content", "")
                     color = QColor(stable_data.get("color", "#FFF9C4"))
                     opacity = stable_data.get("opacity", 85)
-                    
+                    locked = stable_data.get("locked", False)
+
                     position = QPoint(layout_data["position"][0], layout_data["position"][1])
                     size = layout_data["size"]
                     screen_index = layout_data.get("screen_index", 0)
@@ -328,7 +418,8 @@ class StickyNoteManager(QObject):
                     content = stable_data.get("content", "")
                     color = QColor(stable_data.get("color", "#FFF9C4"))
                     opacity = stable_data.get("opacity", 85)
-                    
+                    locked = stable_data.get("locked", False)
+
                     # 为缺失的布局数据提供默认值
                     screens = QApplication.screens()
                     current_screen = QApplication.screenAt(QCursor.pos())
@@ -345,6 +436,7 @@ class StickyNoteManager(QObject):
                     content = note_data.get("content", "")
                     color = QColor(note_data.get("color", "#FFF9C4"))
                     opacity = note_data.get("opacity", 85)
+                    locked = False
                     
                     position = QPoint(note_data["position"][0], note_data["position"][1])
                     size = note_data["size"]
@@ -357,6 +449,7 @@ class StickyNoteManager(QObject):
                     content = str(note_data) if isinstance(note_data, str) else ""
                     color = QColor("#FFF9C4")
                     opacity = 85
+                    locked = False
                     
                     # 提供默认布局数据
                     screens = QApplication.screens()
@@ -381,7 +474,16 @@ class StickyNoteManager(QObject):
                 )
                 note.is_expanded = is_expanded
                 note.edge_snapped = edge_snapped
-                
+                # 卷帘折叠是临时状态，加载时一律展开
+                if note.edge_snapped is None and not note.is_expanded:
+                    note.is_expanded = True
+                note.toggle_lock(locked)
+                # 吸附折叠状态：重放 collapse 重建迷你条外观
+                # （加载只恢复了几何和标记，mini 内容/标题栏/边距需要这里建立）
+                if note.edge_snapped and not note.is_expanded:
+                    note.title_bar.hide()
+                    note.collapse()
+
             except Exception as e:
                 print(f"Failed to load note {note_id}: {e}")
                 # 如果解析失败，创建带有默认值的便签
@@ -430,7 +532,8 @@ class StickyNoteManager(QObject):
         screen_index=None,
     ):
         if note_id is None:
-            note_id = f"note_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            # 带微秒避免同一秒内新建/复制产生相同 id 互相覆盖
+            note_id = f"note_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         if screen_index is None:
             screens = QApplication.screens()
             current_screen = QApplication.screenAt(QCursor.pos())
@@ -455,7 +558,8 @@ class StickyNoteManager(QObject):
             if color:
                 note.set_color(color)
             if opacity is not None:
-                note.set_opacity(opacity)
+                # 通过滑块设置，保证界面滑块位置与实际透明度一致
+                note.opacity_slider.setValue(opacity)
         finally:
             self._loading = False
 
@@ -464,69 +568,104 @@ class StickyNoteManager(QObject):
         note.show()
         return note
 
-    def save_notes(self):
-        """保存便签数据到本地文件并异步同步到Gist"""
+    def save_notes(self, sync_gist=True):
+        """请求保存：本地写盘防抖 500ms，Gist 推送防抖 5s（避免频繁 IO 和 API 限流）"""
+        self.save_timer.start()  # singleShot 定时器重启即实现防抖
+        if sync_gist and self.github_token:
+            self.gist_sync_timer.start()
+
+    def sync_to_gist(self):
+        """手动触发：立即落盘并推送 Gist"""
+        self.save_timer.stop()
+        self._save_notes_now()
+        self.gist_sync_timer.stop()
+        self._sync_to_gist_now()
+
+    def _save_notes_now(self):
+        """实际写入本地文件（由防抖定时器触发，退出前也会直接调用）"""
+        self.save_timer.stop()
         notes_data = {}
-        processed_base_ids = set()
 
         try:
             for note_id, note in self.notes.items():
                 # 保存所有便签，不管是否可见
-                base_id = note_id.split("_screen_")[0]
-                if base_id not in processed_base_ids:
-                    try:
-                        screen = QApplication.screenAt(note.pos())
-                        screen_index = (
-                            QApplication.screens().index(screen) if screen else 0
-                        )
-                        screen_geo = QApplication.screens()[screen_index].geometry()
+                try:
+                    screen = QApplication.screenAt(note.geometry().center())
+                    screen_index = (
+                        QApplication.screens().index(screen) if screen else 0
+                    )
+                    screen_geo = QApplication.screens()[screen_index].geometry()
 
-                        # 计算相对屏幕坐标
-                        rel_x = note.x() - screen_geo.x()
-                        rel_y = note.y() - screen_geo.y()
+                    # 计算相对屏幕坐标
+                    rel_x = note.x() - screen_geo.x()
+                    rel_y = note.y() - screen_geo.y()
 
-                        notes_data[base_id] = {
-                            "stable_data": {
-                                "content": str(note.get_content() or ""),
-                                "color": str(note.color.name() or "#FFF9C4"),
-                                "opacity": int(note.opacity_slider.value() or 85),
-                            },
-                            "layout_data": {
-                                "position": [int(rel_x), int(rel_y)],
-                                "size": [int(note.width()), int(note.height())],
-                                "screen_index": int(screen_index),
-                                "is_expanded": bool(note.is_expanded),
-                                "edge_snapped": (
-                                    str(note.edge_snapped)
-                                    if note.edge_snapped is not None
-                                    else None
-                                ),
-                            }
+                    notes_data[note_id] = {
+                        "stable_data": {
+                            "content": str(note.get_content() or ""),
+                            "color": str(note.color.name() or "#FFF9C4"),
+                            "opacity": int(note.opacity_slider.value() or 85),
+                            "locked": bool(note.is_locked),
+                        },
+                        "layout_data": {
+                            "position": [int(rel_x), int(rel_y)],
+                            "size": [int(note.width()), int(note.height())],
+                            "screen_index": int(screen_index),
+                            "is_expanded": bool(note.is_expanded),
+                            "edge_snapped": (
+                                str(note.edge_snapped)
+                                if note.edge_snapped is not None
+                                else None
+                            ),
                         }
-                        processed_base_ids.add(base_id)
-                    except Exception as e:
-                        print(f"保存便签时出错: {e}")
+                    }
+                except Exception as e:
+                    print(f"保存便签时出错: {e}")
 
-            # 保存到本地文件
-            with open(self.settings_file, "w", encoding="utf-8") as f:
+            # 原子写入：先写临时文件再替换，避免写一半崩溃损坏数据；同时轮换一份 .bak
+            tmp_file = self.settings_file + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(notes_data, f, ensure_ascii=False, indent=2)
-
-            # 异步保存到Gist - 只包含稳定数据（内容、颜色、透明度）
-            if self.github_token:
-                gist_data = {}
-                for note_id, data in notes_data.items():
-                    # 只同步内容数据，不包含布局数据
-                    gist_data[note_id] = {"stable_data": data["stable_data"]}
-                self.gist_worker.save_to_gist(gist_data)
+            if os.path.exists(self.settings_file):
+                shutil.copy2(self.settings_file, self.settings_file + ".bak")
+            os.replace(tmp_file, self.settings_file)
 
         except Exception as e:
             print(f"Critical file save error: {e}")
             traceback.print_exc()
 
+    def _sync_to_gist_now(self):
+        """实际推送 Gist：只包含稳定数据（内容、颜色、透明度），不含布局"""
+        self.gist_sync_timer.stop()
+        if not self.github_token:
+            return
+        gist_data = {}
+        for note_id, note in self.notes.items():
+            gist_data[note_id] = {
+                "stable_data": {
+                    "content": str(note.get_content() or ""),
+                    "color": str(note.color.name() or "#FFF9C4"),
+                    "opacity": int(note.opacity_slider.value() or 85),
+                    "locked": bool(note.is_locked),
+                }
+            }
+        self.gist_worker.save_to_gist(gist_data)
+
     @pyqtSlot(bool, str)
     def on_gist_save_completed(self, success, message):
         """Handle Gist save completion"""
         if success:
+            # 新建 gist 或远端版本前进后，持久化 gist_id 和 updated_at
+            changed = False
+            if self.gist_worker.gist_id and self.gist_worker.gist_id != self.gist_id:
+                self.gist_id = self.gist_worker.gist_id
+                changed = True
+            if self.gist_worker.updated_at and self.gist_worker.updated_at != self.gist_updated_at:
+                self.gist_updated_at = self.gist_worker.updated_at
+                changed = True
+            if changed:
+                self.save_gist_config()
+                print(f"Gist 地址（可用于找回数据）: https://gist.github.com/{self.gist_id}")
             print(f"Gist sync: {message}")
         else:
             print(f"Gist sync failed: {message}")
@@ -536,6 +675,9 @@ class StickyNoteManager(QObject):
         """Handle Gist load completion - update content only, never touch layout"""
         if success:
             print(f"Gist load: {message}")
+            if self.gist_worker.updated_at and self.gist_worker.updated_at != self.gist_updated_at:
+                self.gist_updated_at = self.gist_worker.updated_at
+                self.save_gist_config()
             # 只更新内容，绝不改变位置或大小
             self._loading = True
             try:
@@ -554,7 +696,8 @@ class StickyNoteManager(QObject):
                     content = stable_data.get("content", "")
                     color = QColor(stable_data.get("color", "#FFF9C4"))
                     opacity = stable_data.get("opacity", 85)
-                    
+                    locked = stable_data.get("locked", False)
+
                     if note_id in self.notes:
                         # 更新现有便签的内容，完全不改变位置
                         note = self.notes[note_id]
@@ -562,7 +705,8 @@ class StickyNoteManager(QObject):
                         try:
                             note.set_content(content, replace=True)
                             note.set_color(color)
-                            note.set_opacity(opacity)
+                            note.opacity_slider.setValue(opacity)
+                            note.toggle_lock(locked)
                         finally:
                             note.text_edit.blockSignals(old_auto_save)
                     else:
@@ -612,9 +756,17 @@ class StickyNoteManager(QObject):
                         )
                         note.is_expanded = is_expanded
                         note.edge_snapped = edge_snapped
-                
-                # 保存当前完整状态（内容+布局）
-                self.save_notes()
+                        # 卷帘折叠是临时状态，加载时一律展开
+                        if note.edge_snapped is None and not note.is_expanded:
+                            note.is_expanded = True
+                        note.toggle_lock(locked)
+                        # 吸附折叠状态：重放 collapse 重建迷你条外观
+                        if note.edge_snapped and not note.is_expanded:
+                            note.title_bar.hide()
+                            note.collapse()
+
+                # 保存当前完整状态（内容+布局）到本地，不反向推送 Gist
+                self.save_notes(sync_gist=False)
                     
             finally:
                 self._loading = False
@@ -637,9 +789,18 @@ class StickyNoteManager(QObject):
         # 清理全局快捷键
         if hasattr(self, 'global_hotkey_manager'):
             self.global_hotkey_manager.cleanup()
-        
-        self.save_notes()
+
+        # 停止防抖定时器并立即落盘
+        self.save_timer.stop()
+        self.gist_sync_timer.stop()
+        self._save_notes_now()
         print("Data saved before exit")
+
+    def _poll_notes(self):
+        """统一轮询：边缘吸附检测 + 悬停展开/收缩（替代每个便签各自的定时器）"""
+        for note in list(self.notes.values()):
+            note.check_edge_position()
+            note.check_mouse_hover()
 
     def show_all_notes(self):
         for note in self.notes.values():
@@ -672,12 +833,35 @@ class StickyNoteManager(QObject):
             note_ids = list(self.notes.keys())
             for note_id in note_ids:
                 if note_id in self.notes:  # 确保便签仍然存在
-                    self.notes[note_id].close()
+                    # 直接关闭，不再逐个弹确认框
+                    self.notes[note_id].close_without_confirmation()
             self.notes.clear()
             self.save_notes()
             print("Deleted all notes")
         else:
             print("Deletion of all notes cancelled")
+
+    def export_notes_markdown(self):
+        """导出所有便签为一个 Markdown 文件"""
+        if not self.notes:
+            print("没有便签可以导出")
+            return
+
+        filename = f"pystickies_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        parts = [f"# PyStickies 导出（{datetime.now().strftime('%Y-%m-%d %H:%M')}）\n"]
+        for note_id, note in self.notes.items():
+            content = (note.get_content() or "").strip()
+            title = content.split("\n")[0][:50] if content else "(空便签)"
+            parts.append(f"\n## {title}\n\n{content}\n\n---\n")
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("".join(parts))
+            print(f"已导出 {len(self.notes)} 个便签到 {path}")
+            QMessageBox.information(None, "导出完成", f"已导出 {len(self.notes)} 个便签到:\n{path}")
+        except Exception as e:
+            print(f"导出失败: {e}")
 
     def duplicate_note(self, source_note):
         """复制便签"""
@@ -711,9 +895,11 @@ class StickyNote(QMainWindow):
         self.collapse_windown_size = [50, 30]
         self.full_content = ""
         self.show_preview = False
+        self.is_locked = False
+        self._grip_resizing = False
+        self._drag_unsnap_pending = False
 
         self.init_ui()
-        self.setup_edge_detection()
         self.setup_shortcuts()
         self.setup_context_menu()
 
@@ -746,10 +932,9 @@ class StickyNote(QMainWindow):
         """
         )
 
-        # Layout
+        # Layout（恒定边距给阴影留空间；吸附时窗口探出屏幕外，卡片仍贴合边缘）
         layout = QVBoxLayout(self.main_widget)
-        # layout.setContentsMargins(8, 8, 8, 8)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(CHROME_MARGIN, CHROME_MARGIN, CHROME_MARGIN, CHROME_MARGIN)
         layout.addWidget(self.central_widget)
 
         # Central widget layout
@@ -762,25 +947,8 @@ class StickyNote(QMainWindow):
 
         # Text editor
         self.text_edit = QTextEdit()
-        self.text_edit.setStyleSheet(
-            """
-            QTextEdit {
-                background: transparent;
-                border: none;
-                padding: 10px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto;
-                font-size: 14px;
-                line-height: 1.5;
-                color: #333;
-            }
-            QTextEdit:focus {
-                outline: none;
-            }
-        """
-        )
+        self.text_edit.setStyleSheet(self._editor_style())
         self.text_edit.textChanged.connect(self.on_text_changed)
-
-        # 通过设置窗口标志支持大小调整
 
         # Markdown preview
         self.preview_browser = QTextBrowser()
@@ -812,8 +980,26 @@ class StickyNote(QMainWindow):
 
         central_layout.addWidget(self.content_stack)
 
+        # 底行：右下角调整大小手柄（无边框窗口没有原生拉伸边）
+        bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(0, 0, 0, 0)
+        bottom_row.addStretch()
+        self.size_grip = QSizeGrip(self)
+        self.size_grip.setToolTip("拖动调整大小")
+        self.size_grip.installEventFilter(self)
+        bottom_row.addWidget(self.size_grip, 0, Qt.AlignBottom | Qt.AlignRight)
+        central_layout.addLayout(bottom_row)
+
         self.setCentralWidget(self.main_widget)
         self.resize(self.expand_windown_size[0], self.expand_windown_size[1])
+
+        # 自绘柔和阴影（仅浮动状态启用，吸附时关闭并贴合屏幕边缘）
+        self.shadow_effect = QGraphicsDropShadowEffect(self)
+        self.shadow_effect.setBlurRadius(18)
+        self.shadow_effect.setOffset(0, 3)
+        self.shadow_effect.setColor(QColor(0, 0, 0, 50))
+        self.central_widget.setGraphicsEffect(self.shadow_effect)
+        self._update_chrome()
 
     def create_title_bar(self):
         title_bar = QWidget()
@@ -831,16 +1017,11 @@ class StickyNote(QMainWindow):
         layout = QHBoxLayout(title_bar)
         layout.setContentsMargins(5, 5, 5, 5)
 
-        # Toggle preview button
-        self.preview_btn = QPushButton("📄")
-        self.preview_btn.setFixedSize(24, 24)
-        self.preview_btn.setStyleSheet(
-            """
+        btn_style = """
             QPushButton {
                 background: transparent;
                 border: none;
                 border-radius: 12px;
-                font-size: 12px;
             }
             QPushButton:hover {
                 background: rgba(0, 0, 0, 0.1);
@@ -849,72 +1030,47 @@ class StickyNote(QMainWindow):
                 background: rgba(0, 120, 255, 0.2);
             }
         """
-        )
+
+        # Toggle preview button
+        self.preview_btn = QPushButton()
+        self.preview_btn.setFixedSize(24, 24)
+        self.preview_btn.setStyleSheet(btn_style)
         self.preview_btn.setCheckable(True)
         self.preview_btn.toggled.connect(self.toggle_preview)
         layout.addWidget(self.preview_btn)
 
         # Color picker button
-        color_btn = QPushButton("🎨")
-        color_btn.setFixedSize(24, 24)
-        color_btn.setStyleSheet(
-            """
-            QPushButton {
-                background: transparent;
-                border: none;
-                border-radius: 12px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background: rgba(0, 0, 0, 0.1);
-            }
-        """
-        )
-        color_btn.clicked.connect(self.choose_color)
-        layout.addWidget(color_btn)
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(24, 24)
+        self.color_btn.setStyleSheet(btn_style)
+        self.color_btn.setToolTip("更换颜色（预设色卡 / 自定义）")
+        self.color_btn.clicked.connect(self.choose_color)
+        layout.addWidget(self.color_btn)
 
         # Opacity slider
-        layout.addWidget(QLabel("💡"))
+        self.opacity_icon = QLabel()
+        self.opacity_icon.setToolTip("拖动调整便签透明度")
+        layout.addWidget(self.opacity_icon)
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(30, 100)
         self.opacity_slider.setValue(85)
         self.opacity_slider.setFixedWidth(80)
+        self.opacity_slider.setToolTip("拖动调整便签透明度")
         self.opacity_slider.valueChanged.connect(self.set_opacity)
         layout.addWidget(self.opacity_slider)
 
         layout.addStretch()
 
         # Close button
-        close_btn = QPushButton("❌")
-        close_btn.setFixedSize(24, 24)
-        close_btn.setStyleSheet(
-            """
-            QPushButton {
-                background: transparent;
-                border: none;
-                border-radius: 12px;
-                font-size: 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background: rgba(255, 0, 0, 0.2);
-                color: red;
-            }
-        """
-        )
-        close_btn.clicked.connect(self.close)
-        layout.addWidget(close_btn)
+        self.close_btn = QPushButton()
+        self.close_btn.setFixedSize(24, 24)
+        self.close_btn.setStyleSheet(btn_style)
+        self.close_btn.setToolTip("删除便签")
+        self.close_btn.clicked.connect(self.close)
+        layout.addWidget(self.close_btn)
 
+        self._refresh_icons()
         return title_bar
-
-    def setup_edge_detection(self):
-        self.edge_timer = QTimer()
-        self.edge_timer.timeout.connect(self.check_edge_position)
-        self.edge_timer.start(100)
-
-        self.expand_timer = QTimer()
-        self.expand_timer.timeout.connect(self.check_mouse_hover)
-        self.expand_timer.start(50)
 
     def setup_shortcuts(self):
         # Ctrl+N for new note
@@ -935,6 +1091,12 @@ class StickyNote(QMainWindow):
         duplicate_action.triggered.connect(lambda: self.manager.duplicate_note(self))
         self.addAction(duplicate_action)
 
+        # Ctrl+T 插入当前时间戳
+        ts_action = QAction(self)
+        ts_action.setShortcut(QKeySequence("Ctrl+T"))
+        ts_action.triggered.connect(self.insert_timestamp)
+        self.addAction(ts_action)
+
     def setup_context_menu(self):
         """设置右键菜单"""
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -952,9 +1114,16 @@ class StickyNote(QMainWindow):
         duplicate_action.triggered.connect(lambda: self.manager.duplicate_note(self))
         menu.addAction(duplicate_action)
 
+        # 锁定后内容只读且不可删除，防止误改误删
+        lock_action = QAction("锁定便签", menu)
+        lock_action.setCheckable(True)
+        lock_action.setChecked(self.is_locked)
+        lock_action.triggered.connect(self.toggle_lock)
+        menu.addAction(lock_action)
+
         # 添加手动同步功能
         sync_action = QAction("同步到Gist", menu)
-        sync_action.triggered.connect(lambda: self.manager.save_notes())
+        sync_action.triggered.connect(lambda: self.manager.sync_to_gist())
         menu.addAction(sync_action)
 
         # 添加从Gist加载功能
@@ -971,10 +1140,14 @@ class StickyNote(QMainWindow):
         menu.exec_(self.mapToGlobal(position))
 
     def check_edge_position(self):
-        if self.dragging:
+        if self.dragging or self._grip_resizing or not self.isVisible():
             return
 
-        screen = QApplication.screenAt(self.pos())
+        # 按住 Ctrl 时临时禁用吸附，方便把便签放在靠边但不吸附的位置
+        if QApplication.keyboardModifiers() & Qt.ControlModifier:
+            return
+
+        screen = QApplication.screenAt(self.geometry().center())
         if not screen:
             return
 
@@ -986,30 +1159,32 @@ class StickyNote(QMainWindow):
 
         new_pos = None
         new_edge = None
+        m = CHROME_MARGIN  # 窗口探出屏幕外，让卡片（边距内）贴合屏幕边缘
 
         # Check left edge
         if x - screen_geo.left() <= margin:
-            new_pos = QPoint(screen_geo.left(), y)
+            new_pos = QPoint(screen_geo.left() - m, y)
             new_edge = "left"
         # Check right edge
         elif screen_geo.right() - (x + width) <= margin:
-            new_pos = QPoint(screen_geo.right() - width, y)
+            new_pos = QPoint(screen_geo.right() - width + m, y)
             new_edge = "right"
         # Check top edge
         elif y - screen_geo.top() <= margin:
-            new_pos = QPoint(x, screen_geo.top())
+            new_pos = QPoint(x, screen_geo.top() - m)
             new_edge = "top"
         # Check bottom edge
         elif screen_geo.bottom() - (y + height) <= margin:
-            new_pos = QPoint(x, screen_geo.bottom() - height)
+            new_pos = QPoint(x, screen_geo.bottom() - height + m)
             new_edge = "bottom"
 
         if new_pos and new_pos != self.pos():
             self.move(new_pos)
             self.edge_snapped = new_edge
+            self._update_chrome()
 
     def check_mouse_hover(self):
-        if not self.isVisible():
+        if not self.isVisible() or self._grip_resizing:
             return
 
         cursor_pos = QCursor.pos()
@@ -1028,13 +1203,22 @@ class StickyNote(QMainWindow):
             if trigger_zone.contains(cursor_pos):
                 self.title_bar.show()
                 self.expand()
+        elif self.is_expanded:
+            # 普通状态：悬停显示标题栏，离开自动隐藏（界面更干净）
+            buffer = 8
+            buffered_geo = self.geometry().adjusted(-buffer, -buffer, buffer, buffer)
+            if buffered_geo.contains(cursor_pos):
+                if not self.title_bar.isVisible():
+                    self.title_bar.show()
+            elif self.title_bar.isVisible():
+                self.title_bar.hide()
 
     def get_trigger_zone(self):
         """Get the trigger zone for collapsed notes to prevent jitter"""
         if not self.edge_snapped:
             return self.geometry()
 
-        screen = QApplication.screenAt(self.pos())
+        screen = QApplication.screenAt(self.geometry().center())
         if not screen:
             return self.geometry()
 
@@ -1070,11 +1254,11 @@ class StickyNote(QMainWindow):
 
         return self.geometry()
 
-    def expand(self):
+    def expand(self, animate=True):
         if not self.edge_snapped:
             return
 
-        screen = QApplication.screenAt(self.pos())
+        screen = QApplication.screenAt(self.geometry().center())
         if not screen:
             return
 
@@ -1082,140 +1266,144 @@ class StickyNote(QMainWindow):
         current_geo = self.geometry()
 
         self.is_expanded = True
-        self.text_edit.setStyleSheet(
-            """
-            QTextEdit {
-                background: transparent;
-                border: none;
-                padding: 10px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto;
-                font-size: 14px;
-                line-height: 1.5;
-                color: #333;
-            }
-            QTextEdit:focus {
-                outline: none;
-            }
-        """
-        )
+        self.text_edit.setStyleSheet(self._editor_style())
+        # 恢复展开状态的滚动条
+        self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         new_width = self.expand_windown_size[0]
         new_height = self.expand_windown_size[1]
         self.set_content(self.full_content)
+        m = CHROME_MARGIN  # 窗口探出屏幕外，卡片贴合屏幕边缘
         if self.edge_snapped == "left":
-            new_geo = QRect(screen_geo.left(), current_geo.y(), new_width, new_height)
+            new_geo = QRect(screen_geo.left() - m, current_geo.y(), new_width, new_height)
         elif self.edge_snapped == "right":
             new_geo = QRect(
-                screen_geo.right() - new_width,
+                screen_geo.right() - new_width + m,
                 current_geo.y(),
                 new_width,
                 new_height,
             )
         elif self.edge_snapped == "top":
-            new_geo = QRect(current_geo.x(), screen_geo.top(), new_width, new_height)
+            new_geo = QRect(current_geo.x(), screen_geo.top() - m, new_width, new_height)
         elif self.edge_snapped == "bottom":
             new_geo = QRect(
                 current_geo.x(),
-                screen_geo.bottom() - new_height,
+                screen_geo.bottom() - new_height + m,
                 new_width,
                 new_height,
             )
         else:
             return
 
-        self.setGeometry(new_geo)
+        if animate:
+            self._animate_to(new_geo)
+        else:
+            self.setGeometry(new_geo)
 
-        # 还原正常显示
-        # self.showNormal()
+        # 还原正常显示，清除收缩状态的 tooltip
+        self.setToolTip("")
         self.toggle_preview(self.show_preview, change_default=False)
+        self._update_chrome()
         self.manager.save_notes()
 
     def collapse(self):
         if not self.edge_snapped:
             return
 
-        screen = QApplication.screenAt(self.pos())
+        screen = QApplication.screenAt(self.geometry().center())
         if not screen:
             return
 
         self.is_expanded = False
-        self.text_edit.setStyleSheet(
-            """
-            QTextEdit {
-                background: transparent;
-                border: none;
-                padding: 0px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto;
-                font-size: 14px;
-                line-height: 1.5;
-                color: #333;
-            }
-            QTextEdit:focus {
-                outline: none;
-            }
-        """
-        )
+        self.text_edit.setStyleSheet(self._editor_style(padding=0))
+        # 迷你条只有一行，永远不显示滚动条（否则 Fusion 风格下露出上下箭头按钮）
+        self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         screen_geo = screen.geometry()
         current_geo = self.geometry()
 
-        # 收缩状态下显示第一行，保留标签符号
-        def mini_content(content):
-            # 获取第一行，但保留markdown标签
-            first_line = content.split("\n")[0] if content else ""
-            if not first_line.strip():
-                first_line = "新便签"
-            
-            # 计算宽度，保留原始标签
-            display_text = first_line.strip()
-            width = 0
-            for char in display_text:
-                if ord(char) > 127:
-                    width += 17
-                elif char.isupper():
-                    width += 11
-                else:
-                    width += 9
-            return display_text, width
+        # 收缩状态下显示第一行（去掉 markdown 标记符号），tooltip 显示前几行
+        first_line = self.full_content.split("\n")[0] if self.full_content else ""
+        display_text = first_line.strip().lstrip("#*-> ").strip() or "新便签"
+        self.setToolTip("\n".join(self.full_content.split("\n")[:5]))
+        new_width = 0
+        for char in display_text:
+            if ord(char) > 127:
+                new_width += 17
+            elif char.isupper():
+                new_width += 11
+            else:
+                new_width += 9
 
-        new_content, new_width = mini_content(self.full_content)
-        self.set_content(new_content)
-        new_height = self.collapse_windown_size[1]
-        new_width = max(new_width, self.collapse_windown_size[0])
+        self.set_content(display_text)
+        # collapse_windown_size 是卡片尺寸，窗口需加上四周边距（探出屏幕外的部分）
+        m = CHROME_MARGIN
+        new_height = self.collapse_windown_size[1] + 2 * m
+        new_width = max(new_width, self.collapse_windown_size[0]) + 2 * m
         if self.edge_snapped == "left":
-            new_geo = QRect(screen_geo.left(), current_geo.y(), new_width, new_height)
+            new_geo = QRect(screen_geo.left() - m, current_geo.y(), new_width, new_height)
         elif self.edge_snapped == "right":
             new_geo = QRect(
-                screen_geo.right() - new_width, current_geo.y(), new_width, new_height
+                screen_geo.right() - new_width + m, current_geo.y(), new_width, new_height
             )
         elif self.edge_snapped == "top":
             new_geo = QRect(
-                current_geo.x(), screen_geo.top(), current_geo.width(), new_height
+                current_geo.x(), screen_geo.top() - m, current_geo.width(), new_height
             )
         elif self.edge_snapped == "bottom":
             new_geo = QRect(
                 current_geo.x(),
-                screen_geo.bottom() - new_height,
+                screen_geo.bottom() - new_height + m,
                 current_geo.width(),
                 new_height,
             )
         else:
             return
 
-        self.setGeometry(new_geo)
+        self._animate_to(new_geo)
         self.toggle_preview(False, change_default=False)
+        self._update_chrome()
         # self.manager.save_notes()
 
+    def _in_title_bar(self, pos):
+        """窗口坐标是否落在可拖拽的标题区域（适配浮动边距和折叠迷你条）"""
+        if not self.title_bar.isVisible():
+            # 折叠成迷你条时标题栏隐藏，整个窗口都是拖拽区
+            return not self.is_expanded
+        title_rect = QRect(self.title_bar.mapTo(self, QPoint(0, 0)), self.title_bar.size())
+        return title_rect.contains(pos)
+
+    def eventFilter(self, obj, event):
+        # 调整手柄拖动期间：禁用阴影避免重绘残影，并暂停边缘吸附/折叠轮询
+        if obj is self.size_grip:
+            if event.type() == QEvent.MouseButtonPress:
+                self._grip_resizing = True
+                self.shadow_effect.setEnabled(False)
+            elif event.type() == QEvent.MouseButtonRelease:
+                self._grip_resizing = False
+                self._update_chrome()
+        return super().eventFilter(obj, event)
+
     def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.LeftButton:
-            if event.y() < 30:  # 标题栏区域拖拽
-                self.drag_pos = event.globalPos() - self.frameGeometry().topLeft()
-                self.dragging = True
+        if event.button() == Qt.LeftButton and self._in_title_bar(event.pos()):
+            # 拖出折叠的迷你条：先无动画还原成完整便签（尺寸就绪后再算拖拽偏移）
+            if self.edge_snapped is not None and not self.is_expanded:
+                self.expand(animate=False)
+            self.drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+            self.dragging = True
+            # 脱离吸附的样式变化延迟到真正拖动时（避免单击就突变）
+            self._drag_unsnap_pending = self.edge_snapped is not None
+            if self.edge_snapped is not None:
                 self.edge_snapped = None
                 self.is_expanded = True
-                event.accept()
+            event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if event.buttons() & Qt.LeftButton and self.drag_pos:
+            if self._drag_unsnap_pending:
+                self._drag_unsnap_pending = False
+                self._update_chrome()
             self.move(event.globalPos() - self.drag_pos)
             event.accept()
 
@@ -1223,7 +1411,106 @@ class StickyNote(QMainWindow):
         self.drag_pos = None
         self.dragging = False
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        # 双击标题栏：就地折叠/展开（卷帘效果）
+        if event.button() == Qt.LeftButton and self._in_title_bar(event.pos()) and not self.edge_snapped:
+            self.toggle_shade()
+            event.accept()
+
+    def toggle_shade(self):
+        """就地折叠成标题栏 / 还原（双击标题栏触发）"""
+        if self.edge_snapped:
+            return
+        if self.is_expanded:
+            self.expand_windown_size = [self.width(), self.height()]
+            self.is_expanded = False
+            self.content_stack.hide()
+            self.resize(self.width(), self.title_bar.sizeHint().height() + 2 * CHROME_MARGIN)
+        else:
+            self.is_expanded = True
+            self.content_stack.show()
+            self.resize(self.expand_windown_size[0], self.expand_windown_size[1])
+        self._update_chrome()
+        self.manager.save_notes()
+
+    def insert_timestamp(self):
+        """在光标处插入当前时间戳（Ctrl+T）"""
+        if self.is_locked:
+            return
+        self.text_edit.insertPlainText(datetime.now().strftime("%Y-%m-%d %H:%M "))
+
+    def toggle_lock(self, checked):
+        """锁定/解锁便签：锁定后内容只读且不可删除"""
+        self.is_locked = bool(checked)
+        self.text_edit.setReadOnly(self.is_locked)
+
+    def _icon_color(self):
+        """图标颜色：根据便签底色亮度适配"""
+        lum = 0.299 * self.color.red() + 0.587 * self.color.green() + 0.114 * self.color.blue()
+        return QColor("#f0f0f0") if lum < 128 else QColor("#444")
+
+    def _text_color(self):
+        """文字颜色：深色便签用浅色字，浅色便签用深色字"""
+        lum = 0.299 * self.color.red() + 0.587 * self.color.green() + 0.114 * self.color.blue()
+        return "#f5f5f5" if lum < 128 else "#333"
+
+    def _editor_style(self, padding=10):
+        return f"""
+            QTextEdit {{
+                background: transparent;
+                border: none;
+                padding: {padding}px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto;
+                font-size: 14px;
+                line-height: 1.5;
+                color: {self._text_color()};
+            }}
+            QTextEdit:focus {{
+                outline: none;
+            }}
+        """
+
+    def _refresh_icons(self):
+        """按当前底色和预览状态刷新标题栏图标"""
+        color = self._icon_color()
+        self.preview_btn.setIcon(make_icon("edit" if self.show_preview else "preview", color=color))
+        self.preview_btn.setToolTip("返回编辑" if self.show_preview else "Markdown 预览")
+        self.color_btn.setIcon(make_icon("palette", color=color))
+        self.close_btn.setIcon(make_icon("close", color=color))
+        self.opacity_icon.setPixmap(make_icon("opacity", color=color).pixmap(16, 16))
+
+    def _update_chrome(self):
+        """阴影与调整柄状态。边距恒定不在这里切换（吸附时窗口探出屏幕外，
+        卡片始终贴合边缘），因此吸附/拖出不会改变卡片尺寸"""
+        self.shadow_effect.setEnabled(not self._grip_resizing)
+        self.size_grip.setVisible(self.is_expanded)
+
+    def _animate_to(self, target_geo):
+        """滑动动画过渡到目标位置尺寸"""
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(180)
+        anim.setEasingCurve(QEasingCurve.OutQuad)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(target_geo)
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
+        self._geometry_anim = anim
+
     def choose_color(self):
+        """预设色卡一键换色，也可打开自定义选色"""
+        menu = QMenu(self)
+        for hex_color in PRESET_COLORS:
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(QColor(hex_color))
+            action = QAction(QIcon(pixmap), "", menu)
+            action.triggered.connect(lambda checked=False, h=hex_color: self.set_color(QColor(h)))
+            menu.addAction(action)
+        menu.addSeparator()
+        custom_action = QAction("自定义颜色...", menu)
+        custom_action.triggered.connect(self._choose_custom_color)
+        menu.addAction(custom_action)
+        menu.exec_(QCursor.pos())
+
+    def _choose_custom_color(self):
         color = QColorDialog.getColor(self.color, self)
         if color.isValid():
             self.set_color(color)
@@ -1239,6 +1526,13 @@ class StickyNote(QMainWindow):
             }}
         """
         )
+        # 底色变化后同步适配文字与图标颜色
+        self.text_edit.setStyleSheet(self._editor_style())
+        self._refresh_icons()
+        if self.show_preview:
+            self.update_preview()
+        if not self.manager._loading:
+            self.manager.save_notes()
 
     def set_always_on_top(self, enabled):
         """设置窗口置顶状态"""
@@ -1255,7 +1549,8 @@ class StickyNote(QMainWindow):
         self.activateWindow()
 
         # macOS: 设置窗口级别以在所有桌面显示
-        if MACOS_AVAILABLE:
+        # 仅 cocoa 平台插件下 winId 才是真实 NSView 指针（offscreen 等插件下解引用会崩溃）
+        if MACOS_AVAILABLE and QApplication.platformName() == "cocoa":
             try:
                 win_id = int(self.winId())
                 ns_view = objc.objc_object(c_void_p=win_id)
@@ -1272,12 +1567,15 @@ class StickyNote(QMainWindow):
 
     def set_opacity(self, value):
         self.setWindowOpacity(value / 100)
+        if not self.manager._loading:
+            self.manager.save_notes()
 
     def set_content(self, content, replace=False):
         if replace:
             self.full_content = content
         self.text_edit.setPlainText(content)
-        self.update_preview(content)
+        if self.show_preview:
+            self.update_preview(content)
 
     def get_content(self):
         # return self.text_edit.toPlainText()
@@ -1289,24 +1587,23 @@ class StickyNote(QMainWindow):
         self.full_content = self.text_edit.toPlainText()
         if self.manager._loading:
             return  # 防止加载时的循环
-        self.update_preview()
+        if self.show_preview:
+            self.update_preview()
         self.manager.save_notes()
-
-        print(f"Auto-saved note: {self.note_id}")  # Debug output
 
     def toggle_preview(self, checked, change_default=True):
         if checked:
             if change_default:
                 self.show_preview = True
+            self.update_preview()  # 切到预览时才渲染
             self.text_edit.hide()
             self.preview_browser.show()
-            self.preview_btn.setText("✏️")
         else:
             if change_default:
                 self.show_preview = False
             self.text_edit.show()
             self.preview_browser.hide()
-            self.preview_btn.setText("📄")
+        self._refresh_icons()
 
     def update_preview(self, content=None):
         """Update the markdown preview"""
@@ -1324,7 +1621,7 @@ class StickyNote(QMainWindow):
                             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto; 
                             font-size: 14px; 
                             line-height: 1.5; 
-                            color: #333; 
+                            color: {self._text_color()}; 
                             margin: 0; 
                             padding: 0; 
                         }}
@@ -1390,6 +1687,11 @@ class StickyNote(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
+        if self.is_locked:
+            QMessageBox.information(self, "便签已锁定", "便签已锁定，请先在右键菜单中解锁后再删除。")
+            event.ignore()
+            return
+
         # 显示确认对话框
         content_preview = (
             self.get_content()[:50] + "..."
@@ -1426,7 +1728,7 @@ class GlobalHotkeyManager(QObject):
         if GLOBAL_HOTKEYS_AVAILABLE:
             try:
                 self.setup_global_hotkeys()
-                print("全局快捷键已启用 (Ctrl+Shift+H)")
+                print("全局快捷键已启用 (Ctrl+Shift+H 显隐, Ctrl+Shift+N 新建)")
             except Exception as e:
                 print(f"全局快捷键初始化失败: {e}")
                 print("请安装 pynput: pip install pynput")
@@ -1435,24 +1737,27 @@ class GlobalHotkeyManager(QObject):
     
     def setup_global_hotkeys(self):
         """设置全局快捷键"""
-        def on_hotkey():
-            # 使用Qt的线程安全方式调用
+        # 使用Qt的线程安全方式调用
+        def on_toggle():
             QTimer.singleShot(0, self.toggle_all_notes)
-        
-        # 定义快捷键组合：Ctrl+Shift+H
-        hotkey = keyboard.HotKey(
-            keyboard.HotKey.parse('<ctrl>+<shift>+h'),
-            on_hotkey
-        )
-        
+
+        def on_new_note():
+            QTimer.singleShot(0, self.manager.create_new_note)
+
+        # 定义快捷键组合：Ctrl+Shift+H 切换显示/隐藏，Ctrl+Shift+N 新建便签
+        hotkeys = [
+            keyboard.HotKey(keyboard.HotKey.parse('<ctrl>+<shift>+h'), on_toggle),
+            keyboard.HotKey(keyboard.HotKey.parse('<ctrl>+<shift>+n'), on_new_note),
+        ]
+
         def for_canonical(f):
             return lambda k: f(listener.canonical(k))
-        
+
         listener = keyboard.Listener(
-            on_press=for_canonical(hotkey.press),
-            on_release=for_canonical(hotkey.release)
+            on_press=for_canonical(lambda k: [hk.press(k) for hk in hotkeys]),
+            on_release=for_canonical(lambda k: [hk.release(k) for hk in hotkeys])
         )
-        
+
         self.hotkey_listener = listener
         listener.start()
     
@@ -1524,6 +1829,11 @@ class SystemTrayIcon(QSystemTrayIcon):
         hide_action.triggered.connect(self.manager.hide_all_notes)
         menu.addAction(hide_action)
 
+        # 便签列表子菜单：点击直达对应便签
+        self.notes_menu = QMenu("便签列表")
+        self.notes_menu.aboutToShow.connect(self.rebuild_notes_menu)
+        menu.addMenu(self.notes_menu)
+
         topmost_action = QAction("保持置顶", menu)
         topmost_action.setCheckable(True)
         topmost_action.setChecked(True)
@@ -1534,12 +1844,16 @@ class SystemTrayIcon(QSystemTrayIcon):
 
         # 添加手动同步功能
         sync_action = QAction("同步到Gist", menu)
-        sync_action.triggered.connect(self.manager.save_notes)
+        sync_action.triggered.connect(self.manager.sync_to_gist)
         menu.addAction(sync_action)
 
         load_action = QAction("从Gist加载", menu)
         load_action.triggered.connect(self.manager.sync_from_gist)
         menu.addAction(load_action)
+
+        export_action = QAction("导出为Markdown", menu)
+        export_action.triggered.connect(self.manager.export_notes_markdown)
+        menu.addAction(export_action)
 
         menu.addSeparator()
 
@@ -1560,7 +1874,7 @@ class SystemTrayIcon(QSystemTrayIcon):
         self.setVisible(True)
 
         # 显示提示，告诉用户如何使用
-        hotkey_msg = " (Ctrl+Shift+H 切换显示/隐藏)" if GLOBAL_HOTKEYS_AVAILABLE else ""
+        hotkey_msg = " (Ctrl+Shift+H 显隐, Ctrl+Shift+N 新建)" if GLOBAL_HOTKEYS_AVAILABLE else ""
         self.showMessage(
             "PyStickies", 
             f"右键点击托盘图标新建便签{hotkey_msg}", 
@@ -1578,12 +1892,48 @@ class SystemTrayIcon(QSystemTrayIcon):
         for note in self.manager.notes.values():
             note.set_always_on_top(checked)
 
+    def rebuild_notes_menu(self):
+        """动态生成便签列表（点击直达）"""
+        self.notes_menu.clear()
+        if not self.manager.notes:
+            empty_action = QAction("(无便签)", self.notes_menu)
+            empty_action.setEnabled(False)
+            self.notes_menu.addAction(empty_action)
+            return
+        for note_id, note in self.manager.notes.items():
+            first_line = (note.get_content() or "").split("\n")[0].strip() or "(空便签)"
+            action = QAction(first_line[:30], self.notes_menu)
+            action.triggered.connect(lambda checked=False, n=note: self.focus_note(n))
+            self.notes_menu.addAction(action)
+
+    def focus_note(self, note):
+        """显示并聚焦指定便签"""
+        note.show()
+        note.raise_()
+        note.activateWindow()
+
 
 def main():
+    # 单实例锁：防止重复启动两个实例互相覆盖数据
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pystickies.lock")
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("PyStickies 已经在运行，请勿重复启动")
+        sys.exit(0)
+
     app = QApplication(sys.argv)
 
     # Set app style for dark mode support
     app.setStyle("Fusion")
+
+    # 纯菜单栏工具形态：隐藏 Dock 图标
+    if MACOS_AVAILABLE:
+        try:
+            NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        except Exception as e:
+            print(f"隐藏 Dock 图标失败: {e}")
 
     manager = StickyNoteManager()
 
@@ -1598,6 +1948,13 @@ def main():
 
     # 确保程序退出时保存数据
     app.aboutToQuit.connect(manager.cleanup_and_exit)
+
+    # 响应 SIGTERM（run 脚本 stop 用 kill 终止进程）：Qt 事件循环阻塞在 C++ 层，
+    # 靠空定时器让 Python 定期获得执行权，信号处理器才有机会运行
+    signal.signal(signal.SIGTERM, lambda signum, frame: app.quit())
+    signal_timer = QTimer()
+    signal_timer.timeout.connect(lambda: None)
+    signal_timer.start(500)
 
     sys.exit(app.exec_())
 

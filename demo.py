@@ -1,9 +1,8 @@
 import sys
-import pyautogui
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton
 from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QRect, QEasingCurve
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QCursor
 import objc
 from AppKit import (
     NSApplication,
@@ -100,7 +99,8 @@ class EdgeWindow(QMainWindow):
         )
 
     def check_mouse_position(self):
-        mouse_x, mouse_y = pyautogui.position()
+        cursor_pos = QCursor.pos()
+        mouse_x, mouse_y = cursor_pos.x(), cursor_pos.y()
         win_geo = self.geometry()
 
         # 定义热区范围（右侧20px）:cite[1]
