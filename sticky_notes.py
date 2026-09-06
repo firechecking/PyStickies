@@ -1618,10 +1618,11 @@ class StickyNote(QMainWindow):
         self.opacity_icon.setPixmap(make_icon("opacity", color=color).pixmap(16, 16))
 
     def _update_chrome(self):
-        """阴影与调整柄状态。边距恒定不在这里切换（吸附时窗口探出屏幕外，
-        卡片始终贴合边缘），因此吸附/拖出不会改变卡片尺寸"""
+        """阴影、调整柄与卡片圆角随状态更新。
+        边距恒定不在这里切换（吸附时窗口探出屏幕外，卡片始终贴合边缘）"""
         self.shadow_effect.setEnabled(not self._grip_resizing)
         self.size_grip.setVisible(self.is_expanded)
+        self.central_widget.setStyleSheet(self._card_style())
 
     def _animate_to(self, target_geo):
         """滑动动画过渡到目标位置尺寸"""
@@ -1653,17 +1654,27 @@ class StickyNote(QMainWindow):
         if color.isValid():
             self.set_color(color)
 
-    def set_color(self, color):
-        self.color = color
-        self.central_widget.setStyleSheet(
-            f"""
+    def _card_style(self, radius=None):
+        """便签卡片样式：radius 为圆角（默认按当前状态计算）"""
+        if radius is None:
+            radius = self._current_card_radius()
+        return f"""
             QWidget {{
-                background: {color.name()};
-                border-radius: 12px;
+                background: {self.color.name()};
+                border-radius: {radius}px;
                 border: 1px solid rgba(0, 0, 0, 0.1);
             }}
         """
-        )
+
+    def _current_card_radius(self):
+        """隐藏态色块用小圆角（6px 卡片半径上限 3px，呈胶囊形），其余状态标准圆角"""
+        if self.edge_snapped and not self.is_expanded and self.dock_mode == "sliver":
+            return 3
+        return 12
+
+    def set_color(self, color):
+        self.color = color
+        self.central_widget.setStyleSheet(self._card_style())
         # 底色变化后同步适配文字与图标颜色
         self.text_edit.setStyleSheet(self._editor_style())
         self._refresh_icons()
