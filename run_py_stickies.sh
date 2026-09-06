@@ -53,7 +53,8 @@ start_app() {
     fi
     
     echo "正在启动 $APP_NAME..."
-    nohup "$PYTHON_CMD" "$SCRIPT_DIR/sticky_notes.py" > "$LOG_FILE" 2>&1 &
+    # -u：无缓冲输出，日志实时可见
+    nohup "$PYTHON_CMD" -u "$SCRIPT_DIR/sticky_notes.py" > "$LOG_FILE" 2>&1 &
     local pid=$!
     echo $pid > "$PID_FILE"
     

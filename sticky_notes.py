@@ -255,6 +255,7 @@ class StickyNoteManager(QObject):
     def __init__(self):
         super().__init__()
         self.notes = {}
+        self._hidden_states = {}  # 热键隐藏前各便签的位置和吸附状态
         self._loading = False  # 防止加载时的循环
         self.settings_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "notes_data.json"
@@ -410,7 +411,8 @@ class StickyNoteManager(QObject):
                     screen_index = layout_data.get("screen_index", 0)
                     is_expanded = layout_data.get("is_expanded", False)
                     edge_snapped = layout_data.get("edge_snapped", None)
-                    
+                    dock_mode = layout_data.get("dock_mode", "strip")
+
                 elif "stable_data" in note_data:
                     # Gist格式（只有stable_data）或简化的稳定数据
                     stable_data = note_data["stable_data"]
@@ -430,19 +432,21 @@ class StickyNoteManager(QObject):
                     size = [300, 200]  # 默认大小
                     is_expanded = True
                     edge_snapped = None
-                    
+                    dock_mode = "strip"
+
                 elif "content" in note_data and "position" in note_data:
                     # 旧格式
                     content = note_data.get("content", "")
                     color = QColor(note_data.get("color", "#FFF9C4"))
                     opacity = note_data.get("opacity", 85)
                     locked = False
-                    
+
                     position = QPoint(note_data["position"][0], note_data["position"][1])
                     size = note_data["size"]
                     screen_index = note_data.get("screen_index", 0)
                     is_expanded = note_data.get("is_expanded", False)
                     edge_snapped = note_data.get("edge_snapped", None)
+                    dock_mode = "strip"
                 
                 else:
                     # 最简格式（只有内容）
@@ -461,7 +465,8 @@ class StickyNoteManager(QObject):
                     size = [300, 200]
                     is_expanded = True
                     edge_snapped = None
-                
+                    dock_mode = "strip"
+
                 # 创建新便签，但不触发任何事件
                 note = self.display_note(
                     note_id=note_id,
@@ -474,12 +479,13 @@ class StickyNoteManager(QObject):
                 )
                 note.is_expanded = is_expanded
                 note.edge_snapped = edge_snapped
+                note.dock_mode = dock_mode
                 # 卷帘折叠是临时状态，加载时一律展开
                 if note.edge_snapped is None and not note.is_expanded:
                     note.is_expanded = True
                 note.toggle_lock(locked)
-                # 吸附折叠状态：重放 collapse 重建迷你条外观
-                # （加载只恢复了几何和标记，mini 内容/标题栏/边距需要这里建立）
+                # 吸附折叠状态：重放 collapse 重建细条/色块外观
+                # （加载只恢复了几何和标记，外观需要这里建立）
                 if note.edge_snapped and not note.is_expanded:
                     note.title_bar.hide()
                     note.collapse()
@@ -617,6 +623,7 @@ class StickyNoteManager(QObject):
                                 if note.edge_snapped is not None
                                 else None
                             ),
+                            "dock_mode": str(note.dock_mode),
                         }
                     }
                 except Exception as e:
@@ -716,7 +723,8 @@ class StickyNoteManager(QObject):
                         screen_index = 0
                         is_expanded = True
                         edge_snapped = None
-                        
+                        dock_mode = "strip"
+
                         # 绝对优先使用本地布局数据
                         if note_id in local_data:
                             local_note_data = local_data[note_id]
@@ -727,6 +735,7 @@ class StickyNoteManager(QObject):
                                 screen_index = layout_data.get("screen_index", 0)
                                 is_expanded = layout_data.get("is_expanded", True)
                                 edge_snapped = layout_data.get("edge_snapped", None)
+                                dock_mode = layout_data.get("dock_mode", "strip")
                             elif "position" in local_note_data and "size" in local_note_data:
                                 # 旧格式
                                 position = QPoint(local_note_data["position"][0], local_note_data["position"][1])
@@ -756,11 +765,12 @@ class StickyNoteManager(QObject):
                         )
                         note.is_expanded = is_expanded
                         note.edge_snapped = edge_snapped
+                        note.dock_mode = dock_mode
                         # 卷帘折叠是临时状态，加载时一律展开
                         if note.edge_snapped is None and not note.is_expanded:
                             note.is_expanded = True
                         note.toggle_lock(locked)
-                        # 吸附折叠状态：重放 collapse 重建迷你条外观
+                        # 吸附折叠状态：重放 collapse 重建细条/色块外观
                         if note.edge_snapped and not note.is_expanded:
                             note.title_bar.hide()
                             note.collapse()
@@ -803,14 +813,37 @@ class StickyNoteManager(QObject):
             note.check_mouse_hover()
 
     def show_all_notes(self):
+        """热键/托盘显示：按隐藏前状态还原——窗口态还原位置、其余还原细条。
+        显示操作绝不留下隐藏态色块（隐藏态是临时状态，细条是最低可见形态）"""
         for note in self.notes.values():
-            note.show()
-            note.raise_()
-            note.activateWindow()
+            saved = self._hidden_states.get(note.note_id)
+            if saved is None:
+                # 不在本次隐藏记录里（隐藏期间新建，或应用启动时就是隐藏态色块）
+                if note.edge_snapped and not note.is_expanded and note.dock_mode == "sliver":
+                    note.restore_strip()
+                else:
+                    note.show()
+                    note.raise_()
+                continue
+            geo, prev_edge, prev_mode = saved
+            if note.edge_snapped is None:
+                continue  # 隐藏期间被用户拖出：尊重用户摆放
+            if prev_edge is None:
+                note.undock(geo)  # 窗口态：还原浮动位置
+            else:
+                note.restore_strip()  # 吸附态/隐藏态：还原细条
+        self._hidden_states = {}
 
     def hide_all_notes(self):
+        """热键/托盘隐藏：所有便签收缩到屏幕边缘成 6px 色块（鼠标划过自动展开）"""
+        self._hidden_states = {}
         for note in self.notes.values():
-            note.hide()
+            self._hidden_states[note.note_id] = (
+                note.geometry(),
+                note.edge_snapped,
+                note.dock_mode,
+            )
+            note.dock_to_edge()
 
     def delete_all_notes(self):
         """删除所有便签"""
@@ -888,6 +921,8 @@ class StickyNote(QMainWindow):
         self.color = QColor("#FFF9C4")
         self.is_expanded = True
         self.edge_snapped = None
+        # 吸附形态：strip=显示首行的细条（吸附态）/ sliver=6px 色块（隐藏态）
+        self.dock_mode = "strip"
         self.drag_pos = None
         self.dragging = False
         self.resizing = False
@@ -1181,6 +1216,7 @@ class StickyNote(QMainWindow):
         if new_pos and new_pos != self.pos():
             self.move(new_pos)
             self.edge_snapped = new_edge
+            self.dock_mode = "strip"  # 手动吸附默认细条形态（吸附态）
             self._update_chrome()
 
     def check_mouse_hover(self):
@@ -1266,6 +1302,10 @@ class StickyNote(QMainWindow):
         current_geo = self.geometry()
 
         self.is_expanded = True
+        # 从隐藏态色块恢复：重新接收鼠标事件、显示内容
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        if self.content_stack.isHidden():
+            self.content_stack.show()
         self.text_edit.setStyleSheet(self._editor_style())
         # 恢复展开状态的滚动条
         self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -1316,55 +1356,153 @@ class StickyNote(QMainWindow):
 
         self.is_expanded = False
         self.text_edit.setStyleSheet(self._editor_style(padding=0))
-        # 迷你条只有一行，永远不显示滚动条（否则 Fusion 风格下露出上下箭头按钮）
+        # 收缩态不显示滚动条（否则 Fusion 风格下露出上下箭头按钮）
         self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         screen_geo = screen.geometry()
         current_geo = self.geometry()
 
-        # 收缩状态下显示第一行（去掉 markdown 标记符号），tooltip 显示前几行
-        first_line = self.full_content.split("\n")[0] if self.full_content else ""
-        display_text = first_line.strip().lstrip("#*-> ").strip() or "新便签"
-        self.setToolTip("\n".join(self.full_content.split("\n")[:5]))
-        new_width = 0
-        for char in display_text:
-            if ord(char) > 127:
-                new_width += 17
-            elif char.isupper():
-                new_width += 11
-            else:
-                new_width += 9
-
-        self.set_content(display_text)
-        # collapse_windown_size 是卡片尺寸，窗口需加上四周边距（探出屏幕外的部分）
-        m = CHROME_MARGIN
-        new_height = self.collapse_windown_size[1] + 2 * m
-        new_width = max(new_width, self.collapse_windown_size[0]) + 2 * m
-        if self.edge_snapped == "left":
-            new_geo = QRect(screen_geo.left() - m, current_geo.y(), new_width, new_height)
-        elif self.edge_snapped == "right":
-            new_geo = QRect(
-                screen_geo.right() - new_width + m, current_geo.y(), new_width, new_height
-            )
-        elif self.edge_snapped == "top":
-            new_geo = QRect(
-                current_geo.x(), screen_geo.top() - m, current_geo.width(), new_height
-            )
-        elif self.edge_snapped == "bottom":
-            new_geo = QRect(
-                current_geo.x(),
-                screen_geo.bottom() - new_height + m,
-                current_geo.width(),
-                new_height,
-            )
+        if self.dock_mode == "sliver":
+            new_geo = self._sliver_geometry(screen_geo, current_geo)
         else:
-            return
+            new_geo = self._strip_geometry(screen_geo, current_geo)
 
         self._animate_to(new_geo)
         self.toggle_preview(False, change_default=False)
         self._update_chrome()
         # self.manager.save_notes()
+
+    def _mini_display(self):
+        """吸附态细条显示的首行文字和卡片宽度（按文字估算）"""
+        first_line = self.full_content.split("\n")[0] if self.full_content else ""
+        display_text = first_line.strip().lstrip("#*-> ").strip() or "新便签"
+        width = 0
+        for char in display_text:
+            if ord(char) > 127:
+                width += 17
+            elif char.isupper():
+                width += 11
+            else:
+                width += 9
+        return display_text, max(width, self.collapse_windown_size[0])
+
+    def _strip_geometry(self, screen_geo, current_geo):
+        """吸附态几何：显示首行的细条（同时恢复内容可见性和事件接收）"""
+        display_text, card_width = self._mini_display()
+        self.setToolTip("\n".join(self.full_content.split("\n")[:5]))
+
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        if self.content_stack.isHidden():
+            self.content_stack.show()
+        self.set_content(display_text)
+        # collapse_windown_size 是卡片尺寸，窗口需加上四周边距（探出屏幕外的部分）
+        m = CHROME_MARGIN
+        new_height = self.collapse_windown_size[1] + 2 * m
+        new_width = card_width + 2 * m
+        if self.edge_snapped == "left":
+            return QRect(screen_geo.left() - m, current_geo.y(), new_width, new_height)
+        elif self.edge_snapped == "right":
+            return QRect(screen_geo.right() - new_width + m, current_geo.y(), new_width, new_height)
+        elif self.edge_snapped == "top":
+            return QRect(current_geo.x(), screen_geo.top() - m, current_geo.width(), new_height)
+        elif self.edge_snapped == "bottom":
+            return QRect(current_geo.x(), screen_geo.bottom() - new_height + m, current_geo.width(), new_height)
+
+    def _sliver_geometry(self, screen_geo, current_geo):
+        """隐藏态几何：6px 色块，沿边缘方向的长度与吸附态细条一致；
+        纯颜色不显示内容，点击穿透（悬停检测走全局轮询，不依赖窗口接收事件），不遮挡其他应用"""
+        self.setToolTip("")
+        self.content_stack.hide()
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        m = CHROME_MARGIN
+        if self.edge_snapped in ("left", "right"):
+            # 竖向色块：6px 宽，高度与吸附态细条的高度一致
+            new_width = 6 + 2 * m
+            new_height = self.collapse_windown_size[1] + 2 * m
+            new_y = max(screen_geo.top(), min(current_geo.y(), screen_geo.bottom() - new_height))
+            if self.edge_snapped == "left":
+                return QRect(screen_geo.left() - m, new_y, new_width, new_height)
+            else:
+                return QRect(screen_geo.right() - new_width + m, new_y, new_width, new_height)
+        else:
+            # 横向色块：6px 高，宽度与吸附态细条的宽度一致
+            _, card_w = self._mini_display()
+            new_width = card_w + 2 * m
+            new_height = 6 + 2 * m
+            new_x = max(screen_geo.left(), min(current_geo.x(), screen_geo.right() - new_width))
+            if self.edge_snapped == "top":
+                return QRect(new_x, screen_geo.top() - m, new_width, new_height)
+            else:
+                return QRect(new_x, screen_geo.bottom() - new_height + m, new_width, new_height)
+
+    def _nearest_edge(self):
+        """距离便签中心最近的屏幕边缘"""
+        screen = QApplication.screenAt(self.geometry().center())
+        if not screen:
+            return "left"
+        geo = screen.geometry()
+        c = self.geometry().center()
+        dists = {
+            "left": abs(c.x() - geo.left()),
+            "right": abs(geo.right() - c.x()),
+            "top": abs(c.y() - geo.top()),
+            "bottom": abs(geo.bottom() - c.y()),
+        }
+        return min(dists, key=dists.get)
+
+    def dock_to_edge(self):
+        """热键隐藏：吸附到最近的屏幕边缘并收缩成 6px 色块（鼠标划过自动展开）"""
+        if self.edge_snapped and not self.is_expanded and self.dock_mode == "sliver":
+            return  # 已经是隐藏态色块
+        # 记住展开尺寸，悬停展开时还原
+        if self.is_expanded:
+            self.expand_windown_size = [self.width(), self.height()]
+        if not self.edge_snapped:
+            self.edge_snapped = self._nearest_edge()
+        self.dock_mode = "sliver"
+        screen = QApplication.screenAt(self.geometry().center())
+        if not screen:
+            return
+        geo = screen.geometry()
+        m = CHROME_MARGIN  # 窗口探出屏幕外，色块贴合边缘
+        if self.edge_snapped == "left":
+            self.move(geo.left() - m, self.y())
+        elif self.edge_snapped == "right":
+            self.move(geo.right() - self.width() + m, self.y())
+        elif self.edge_snapped == "top":
+            self.move(self.x(), geo.top() - m)
+        elif self.edge_snapped == "bottom":
+            self.move(self.x(), geo.bottom() - self.height() + m)
+        self.show()
+        self.title_bar.hide()
+        self.collapse()
+
+    def undock(self, geometry):
+        """热键显示：从边缘还原到浮动位置和尺寸（窗口态）"""
+        self.edge_snapped = None
+        self.dock_mode = "strip"
+        self.is_expanded = True
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.text_edit.setStyleSheet(self._editor_style())
+        self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        if self.content_stack.isHidden():
+            self.content_stack.show()
+        self.set_content(self.full_content)
+        self.setGeometry(geometry)
+        self.setToolTip("")
+        self.toggle_preview(self.show_preview, change_default=False)
+        self._update_chrome()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.manager.save_notes()
+
+    def restore_strip(self):
+        """从隐藏态色块恢复成吸附态细条"""
+        self.dock_mode = "strip"
+        self.collapse()
 
     def _in_title_bar(self, pos):
         """窗口坐标是否落在可拖拽的标题区域（适配浮动边距和折叠迷你条）"""
