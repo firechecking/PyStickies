@@ -59,7 +59,7 @@ except ImportError:
 # macOS specific imports for all-desktop support
 try:
     import objc
-    from AppKit import NSStatusWindowLevel, NSFloatingWindowLevel, NSApplicationActivationPolicyAccessory
+    from AppKit import NSApplicationActivationPolicyAccessory
     from Cocoa import NSApplication, NSApp, NSWindowCollectionBehaviorCanJoinAllSpaces
 
     MACOS_AVAILABLE = True
@@ -967,14 +967,21 @@ class StickyNote(QMainWindow):
         self.is_locked = False
         self._grip_resizing = False
         self._drag_unsnap_pending = False
+        self._native_dragging = False
+        # 原生拖拽期间收不到 mouseReleaseEvent，用定时器检测按键释放
+        self._drag_watch_timer = QTimer(self)
+        self._drag_watch_timer.setInterval(80)
+        self._drag_watch_timer.timeout.connect(self._check_native_drag_end)
 
         self.init_ui()
         self.setup_shortcuts()
         self.setup_context_menu()
 
     def init_ui(self):
-        # 简化置顶设置，确保有效
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        # 简化置顶设置，确保有效；NoDropShadowWindowHint 关闭 macOS 原生窗口阴影/细边框
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint
+        )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(20, 10)  # 最小尺寸
         self.setMaximumSize(600, 400)  # 最大尺寸
@@ -1559,19 +1566,53 @@ class StickyNote(QMainWindow):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton and self._in_title_bar(event.pos()):
-            # 拖出折叠的迷你条：先无动画还原成完整便签（尺寸就绪后再算拖拽偏移）
+            # 拖出折叠的迷你条：先无动画还原成完整便签
             if self.edge_snapped is not None and not self.is_expanded:
                 self.expand(animate=False)
-            self.drag_pos = event.globalPos() - self.frameGeometry().topLeft()
-            self.dragging = True
-            # 脱离吸附的样式变化延迟到真正拖动时（避免单击就突变）
             self._drag_unsnap_pending = self.edge_snapped is not None
             if self.edge_snapped is not None:
                 self.edge_snapped = None
                 self.is_expanded = True
+            # macOS：优先用窗口服务器原生拖拽——鼠标跨屏/跨 Space 后事件流会中断，
+            # 程序化拖拽会被钳在原屏；原生拖拽由系统接管，可自由跨显示器
+            if self._start_native_drag():
+                self.dragging = True
+                self._native_dragging = True
+                self._update_chrome()
+                self._drag_watch_timer.start()
+            else:
+                # 回退：程序化拖拽（非 macOS 或原生拖拽不可用）
+                self.drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+                self.dragging = True
             event.accept()
 
+    def _start_native_drag(self):
+        """用 NSWindow 原生拖拽拖动窗口，成功返回 True"""
+        if not (MACOS_AVAILABLE and QApplication.platformName() == "cocoa"):
+            return False
+        try:
+            ns_view = objc.objc_object(c_void_p=int(self.winId()))
+            ns_window = ns_view.window()
+            ns_event = ns_window.currentEvent()
+            if ns_event is None:
+                return False
+            ns_window.performWindowDragWithEvent_(ns_event)
+            return True
+        except Exception as e:
+            print(f"native drag failed, fallback to qt drag: {e}")
+            return False
+
+    def _check_native_drag_end(self):
+        """原生拖拽结束检测（拖拽期间收不到 mouseReleaseEvent）"""
+        if not (QApplication.mouseButtons() & Qt.LeftButton):
+            self._drag_watch_timer.stop()
+            self.dragging = False
+            self._native_dragging = False
+            self.manager.save_notes()
+
     def mouseMoveEvent(self, event: QMouseEvent):
+        if self._native_dragging:
+            return  # 原生拖拽由窗口服务器负责
         if event.buttons() & Qt.LeftButton and self.drag_pos:
             if self._drag_unsnap_pending:
                 self._drag_unsnap_pending = False
@@ -1582,6 +1623,8 @@ class StickyNote(QMainWindow):
     def mouseReleaseEvent(self, event: QMouseEvent):
         self.drag_pos = None
         self.dragging = False
+        self._native_dragging = False
+        self._drag_watch_timer.stop()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         # 双击标题栏：就地折叠/展开（卷帘效果）
@@ -1738,8 +1781,9 @@ class StickyNote(QMainWindow):
                 win_id = int(self.winId())
                 ns_view = objc.objc_object(c_void_p=win_id)
                 ns_window = ns_view.window()
-                # 使用 NSFloatingWindowLevel 确保在所有空间显示
-                ns_window.setLevel_(NSFloatingWindowLevel + 1)
+                # 不要手动 setLevel_：NSFloatingWindowLevel+1(=4) 低于菜单栏层级(8)，
+                # 窗口会被钳制在菜单栏以下——外接屏在上方时跨屏拖动被卡死
+                # （实测窗口顶边被钳在 y=32 菜单栏线）。置顶交给 Qt 的 WindowStaysOnTopHint（层级 8）。
                 # 确保窗口在所有空间都可见
                 behavior = ns_window.collectionBehavior()
                 behavior |= NSWindowCollectionBehaviorCanJoinAllSpaces
