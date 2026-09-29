@@ -129,16 +129,26 @@ def make_icon(kind, color=None, size=16):
 
 
 class ResizeGrip(QWidget):
-    """右下角调整大小手柄：自绘三条斜线（替代 QSizeGrip 的原生方块样式）"""
+    """调整大小手柄：自绘三条斜线（替代 QSizeGrip 的原生方块样式）。
+    角落随吸附边变化：右吸附→左下角，下吸附→右上角，其余→右下角；
+    缩放方向朝向屏幕内侧（右吸附拉左边缘、下吸附拉上边缘）"""
 
     def __init__(self, note):
         super().__init__(note.central_widget)
         self.note = note
+        self.corner = "br"  # br=右下 bl=左下 tr=右上
         self.setFixedSize(14, 14)
         self.setCursor(Qt.SizeFDiagCursor)
         self.setToolTip("拖动调整大小")
         self._drag_start = None
         self._start_geo = None
+
+    def set_corner(self, corner, cursor):
+        """切换手柄所在角落和光标样式"""
+        if corner != self.corner:
+            self.corner = corner
+            self.setCursor(cursor)
+            self.update()  # 触发重绘斜线方向
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -147,9 +157,16 @@ class ResizeGrip(QWidget):
         color.setAlpha(150)
         painter.setPen(QPen(color, 1.6, Qt.SolidLine, Qt.RoundCap))
         w, h = self.width(), self.height()
-        # 三条长度递增的斜线（右下角经典拉伸条纹）
-        for start in (2, 6, 10):
-            painter.drawLine(start, h - 2, w - 2, start)
+        # 三条长度递增的斜线，方向随角落变化
+        if self.corner == "bl":      # 左下：⋱
+            for start in (2, 6, 10):
+                painter.drawLine(w - start, h - 2, 2, start)
+        elif self.corner == "tr":    # 右上：⋱
+            for start in (2, 6, 10):
+                painter.drawLine(start, 2, w - 2, h - start)
+        else:                        # 右下：⋰
+            for start in (2, 6, 10):
+                painter.drawLine(start, h - 2, w - 2, start)
         painter.end()
 
     def mousePressEvent(self, event):
@@ -164,10 +181,24 @@ class ResizeGrip(QWidget):
     def mouseMoveEvent(self, event):
         if self._drag_start is not None and event.buttons() & Qt.LeftButton:
             delta = event.globalPos() - self._drag_start
-            self.note.resize(
-                self._start_geo.width() + delta.x(),
-                self._start_geo.height() + delta.y(),
-            )
+            geo = self._start_geo
+            min_w, max_w = self.note.minimumWidth(), self.note.maximumWidth()
+            min_h, max_h = self.note.minimumHeight(), self.note.maximumHeight()
+            if self.corner == "bl":
+                # 右吸附：右边缘固定，向左拉宽
+                w = min(max(geo.width() - delta.x(), min_w), max_w)
+                h = min(max(geo.height() + delta.y(), min_h), max_h)
+                self.note.setGeometry(geo.x() + geo.width() - w, geo.y(), w, h)
+            elif self.corner == "tr":
+                # 下吸附：下边缘固定，向上拉高
+                w = min(max(geo.width() + delta.x(), min_w), max_w)
+                h = min(max(geo.height() - delta.y(), min_h), max_h)
+                self.note.setGeometry(geo.x(), geo.y() + geo.height() - h, w, h)
+            else:
+                # 默认：向右下拉大
+                w = min(max(geo.width() + delta.x(), min_w), max_w)
+                h = min(max(geo.height() + delta.y(), min_h), max_h)
+                self.note.resize(w, h)
             event.accept()
 
     def mouseReleaseEvent(self, event):
@@ -1770,6 +1801,7 @@ class StickyNote(QMainWindow):
         self.shadow_effect.setEnabled(not self._grip_resizing)
         self.size_grip.setVisible(self.is_expanded)
         self.central_widget.setStyleSheet(self._card_style())
+        self._reposition_grip()  # 吸附边变化时手柄角落跟着切换
 
     def _stop_geometry_animation(self):
         """停止进行中的几何动画（动画与状态切换竞争会产生"标记展开、实际细条"的僵尸状态）"""
@@ -1987,19 +2019,30 @@ class StickyNote(QMainWindow):
             self.manager.save_notes()
 
     def _reposition_grip(self):
-        """把调整手柄悬浮到卡片右下角（不占布局空间）"""
+        """把手柄悬浮到卡片合适角落：右吸附→左下角，下吸附→右上角，其余→右下角"""
         if not hasattr(self, "size_grip"):
             return
-        # 手柄先收缩到 sizeHint（默认 100x30 是未布局时的占位尺寸），再按卡片角点定位
+        if self.edge_snapped == "right":
+            corner, cursor = "bl", Qt.SizeBDiagCursor
+        elif self.edge_snapped == "bottom":
+            corner, cursor = "tr", Qt.SizeBDiagCursor
+        else:
+            corner, cursor = "br", Qt.SizeFDiagCursor
+        self.size_grip.set_corner(corner, cursor)
         hint = self.size_grip.sizeHint()
         if hint.isValid() and self.size_grip.size() != hint:
             self.size_grip.resize(hint)
-        corner = self.central_widget.rect().bottomRight()
-        p = self.central_widget.mapTo(self.size_grip.parentWidget(), corner)
-        self.size_grip.move(
-            p.x() - self.size_grip.width() - 3,
-            p.y() - self.size_grip.height() - 3,
-        )
+        gw, gh = self.size_grip.width(), self.size_grip.height()
+        parent = self.size_grip.parentWidget()
+        if corner == "bl":
+            p = self.central_widget.mapTo(parent, self.central_widget.rect().bottomLeft())
+            self.size_grip.move(p.x() + 3, p.y() - gh - 3)
+        elif corner == "tr":
+            p = self.central_widget.mapTo(parent, self.central_widget.rect().topRight())
+            self.size_grip.move(p.x() - gw - 3, p.y() + 3)
+        else:
+            p = self.central_widget.mapTo(parent, self.central_widget.rect().bottomRight())
+            self.size_grip.move(p.x() - gw - 3, p.y() - gh - 3)
 
     def close_without_confirmation(self):
         """直接关闭便签，不显示确认窗口"""
