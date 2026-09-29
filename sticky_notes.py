@@ -18,7 +18,6 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon,
     QTextBrowser,
     QMessageBox,
-    QSizeGrip,
     QGraphicsDropShadowEffect,
 )
 from PyQt5.QtCore import (
@@ -28,7 +27,6 @@ from PyQt5.QtCore import (
     QRect,
     QPoint,
     QSettings,
-    QEvent,
     QEasingCurve,
     pyqtSignal,
     QObject,
@@ -76,42 +74,109 @@ CHROME_MARGIN = 12
 
 
 def make_icon(kind, color=None, size=16):
-    """自绘矢量图标：风格统一，替代 emoji（不同系统渲染不一致）"""
+    """自绘矢量图标：风格统一精致，替代 emoji（不同系统渲染不一致）"""
     if color is None:
         color = QColor("#444")
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
-    painter.setPen(QPen(color, 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    painter.setPen(QPen(color, max(1.3, size / 9.0), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    s = size
 
-    if kind == "preview":  # 眼睛：进入预览
+    if kind == "preview":  # 眼睛：Markdown 预览
         painter.setBrush(Qt.NoBrush)
-        painter.drawEllipse(1, 4, size - 2, size - 8)
+        # 杏仁形眼眶 = 上下两条弧线
+        painter.drawArc(1, s // 4, s - 2, s // 2, 0, 180 * 16)
+        painter.drawArc(1, s // 4, s - 2, s // 2, 180 * 16, 180 * 16)
+        # 实心瞳孔
         painter.setBrush(color)
-        painter.drawEllipse(size // 2 - 2, size // 2 - 2, 4, 4)
-    elif kind == "edit":  # 铅笔：返回编辑
+        painter.drawEllipse(s // 2 - s // 8, s // 2 - s // 8, s // 4, s // 4)
+    elif kind == "edit":  # 铅笔：返回编辑（45° 笔身 + 实心笔尖）
+        painter.save()
+        painter.translate(s / 2, s / 2)
+        painter.rotate(-45)
         painter.setBrush(Qt.NoBrush)
-        painter.drawLine(3, size - 3, size - 7, 6)
-        painter.drawLine(size - 7, 6, size - 3, 2)
-    elif kind == "palette":  # 调色盘：换颜色
-        painter.setBrush(Qt.NoBrush)
-        painter.drawEllipse(2, 2, size - 4, size - 4)
+        painter.drawRect(-s // 8, -s // 3, s // 4, s // 2)
         painter.setBrush(color)
-        painter.drawEllipse(5, 5, 3, 3)
-        painter.drawEllipse(size - 8, 5, 3, 3)
-        painter.drawEllipse(size // 2 - 1, size - 8, 3, 3)
-    elif kind == "opacity":  # 半满圆：透明度
+        painter.drawRect(-s // 8, s // 6, s // 4, s // 6)
+        painter.restore()
+    elif kind == "palette":  # 调色盘：圆盘 + 三颗彩色颜料
         painter.setBrush(Qt.NoBrush)
-        painter.drawEllipse(2, 2, size - 4, size - 4)
+        painter.drawEllipse(1, 1, s - 2, s - 2)
+        dots = [
+            (QColor("#EF5350"), s * 0.32, s * 0.30),
+            (QColor("#FFCA28"), s * 0.62, s * 0.36),
+            (QColor("#42A5F5"), s * 0.44, s * 0.62),
+        ]
+        d = max(2.0, s * 0.18)
+        painter.setPen(Qt.NoPen)
+        for c, fx, fy in dots:
+            painter.setBrush(c)
+            painter.drawEllipse(int(s * fx - d / 2), int(s * fy - d / 2), int(d), int(d))
+    elif kind == "opacity":  # 对比度圆：透明度
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(2, 2, s - 4, s - 4)
         painter.setBrush(color)
-        painter.drawPie(2, 2, size - 4, size - 4, -90 * 16, 180 * 16)
-    elif kind == "close":  # 叉：关闭
-        painter.drawLine(4, 4, size - 4, size - 4)
-        painter.drawLine(size - 4, 4, 4, size - 4)
+        painter.drawPie(2, 2, s - 4, s - 4, -90 * 16, 180 * 16)
+    elif kind == "close":  # 叉：删除
+        a, b = round(s * 0.28), round(s * 0.72)
+        painter.drawLine(a, a, b, b)
+        painter.drawLine(b, a, a, b)
 
     painter.end()
     return QIcon(pixmap)
+
+
+class ResizeGrip(QWidget):
+    """右下角调整大小手柄：自绘三条斜线（替代 QSizeGrip 的原生方块样式）"""
+
+    def __init__(self, note):
+        super().__init__(note.central_widget)
+        self.note = note
+        self.setFixedSize(14, 14)
+        self.setCursor(Qt.SizeFDiagCursor)
+        self.setToolTip("拖动调整大小")
+        self._drag_start = None
+        self._start_geo = None
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        color = self.note._icon_color()
+        color.setAlpha(150)
+        painter.setPen(QPen(color, 1.6, Qt.SolidLine, Qt.RoundCap))
+        w, h = self.width(), self.height()
+        # 三条长度递增的斜线（右下角经典拉伸条纹）
+        for start in (2, 6, 10):
+            painter.drawLine(start, h - 2, w - 2, start)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start = event.globalPos()
+            self._start_geo = self.note.geometry()
+            self.note._grip_resizing = True
+            # 缩放期间临时关闭阴影，避免快速重绘残影
+            self.note.shadow_effect.setEnabled(False)
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is not None and event.buttons() & Qt.LeftButton:
+            delta = event.globalPos() - self._drag_start
+            self.note.resize(
+                self._start_geo.width() + delta.x(),
+                self._start_geo.height() + delta.y(),
+            )
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_start is not None:
+            self._drag_start = None
+            self.note._grip_resizing = False
+            self.note._update_chrome()
+            self.note.manager.save_notes()
+            event.accept()
 
 
 class GistWorker(QThread):
@@ -1076,10 +1141,8 @@ class StickyNote(QMainWindow):
         self.setCentralWidget(self.main_widget)
         self.resize(self.expand_windown_size[0], self.expand_windown_size[1])
 
-        # 调整大小手柄：悬浮在卡片右下角，不占布局空间（底部不再占文字区域）
-        self.size_grip = QSizeGrip(self.central_widget)
-        self.size_grip.setToolTip("拖动调整大小")
-        self.size_grip.installEventFilter(self)
+        # 调整大小手柄：自绘三条斜线，悬浮在卡片右下角（不占布局空间）
+        self.size_grip = ResizeGrip(self)
 
         # 自绘柔和阴影（仅浮动状态启用，吸附时关闭并贴合屏幕边缘）
         self.shadow_effect = QGraphicsDropShadowEffect(self)
@@ -1570,17 +1633,6 @@ class StickyNote(QMainWindow):
             return not self.is_expanded
         title_rect = QRect(self.title_bar.mapTo(self, QPoint(0, 0)), self.title_bar.size())
         return title_rect.contains(pos)
-
-    def eventFilter(self, obj, event):
-        # 调整手柄拖动期间：禁用阴影避免重绘残影，并暂停边缘吸附/折叠轮询
-        if obj is self.size_grip:
-            if event.type() == QEvent.MouseButtonPress:
-                self._grip_resizing = True
-                self.shadow_effect.setEnabled(False)
-            elif event.type() == QEvent.MouseButtonRelease:
-                self._grip_resizing = False
-                self._update_chrome()
-        return super().eventFilter(obj, event)
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton and self._in_title_bar(event.pos()):
