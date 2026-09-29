@@ -440,6 +440,7 @@ class StickyNoteManager(QObject):
                     is_expanded = layout_data.get("is_expanded", False)
                     edge_snapped = layout_data.get("edge_snapped", None)
                     dock_mode = layout_data.get("dock_mode", "strip")
+                    expand_size = layout_data.get("expand_size", None)
 
                 elif "stable_data" in note_data:
                     # Gist格式（只有stable_data）或简化的稳定数据
@@ -461,6 +462,7 @@ class StickyNoteManager(QObject):
                     is_expanded = True
                     edge_snapped = None
                     dock_mode = "strip"
+                    expand_size = None
 
                 elif "content" in note_data and "position" in note_data:
                     # 旧格式
@@ -475,7 +477,8 @@ class StickyNoteManager(QObject):
                     is_expanded = note_data.get("is_expanded", False)
                     edge_snapped = note_data.get("edge_snapped", None)
                     dock_mode = "strip"
-                
+                    expand_size = None
+
                 else:
                     # 最简格式（只有内容）
                     content = str(note_data) if isinstance(note_data, str) else ""
@@ -494,6 +497,7 @@ class StickyNoteManager(QObject):
                     is_expanded = True
                     edge_snapped = None
                     dock_mode = "strip"
+                    expand_size = None
 
                 # 校正布局：坐标落到有效屏幕、异常尺寸恢复默认
                 position, size = self._sanitize_layout(position, size, edge_snapped, is_expanded)
@@ -511,6 +515,8 @@ class StickyNoteManager(QObject):
                 note.is_expanded = is_expanded
                 note.edge_snapped = edge_snapped
                 note.dock_mode = dock_mode
+                if expand_size:
+                    note.expand_windown_size = expand_size
                 # 卷帘折叠是临时状态，加载时一律展开
                 if note.edge_snapped is None and not note.is_expanded:
                     note.is_expanded = True
@@ -655,6 +661,8 @@ class StickyNoteManager(QObject):
                                 else None
                             ),
                             "dock_mode": str(note.dock_mode),
+                            # 用户手柄调整后的展开尺寸，折叠/展开及重启后按此恢复
+                            "expand_size": [int(note.expand_windown_size[0]), int(note.expand_windown_size[1])],
                         }
                     }
                 except Exception as e:
@@ -755,6 +763,7 @@ class StickyNoteManager(QObject):
                         is_expanded = True
                         edge_snapped = None
                         dock_mode = "strip"
+                        expand_size = None
 
                         # 绝对优先使用本地布局数据
                         if note_id in local_data:
@@ -767,6 +776,7 @@ class StickyNoteManager(QObject):
                                 is_expanded = layout_data.get("is_expanded", True)
                                 edge_snapped = layout_data.get("edge_snapped", None)
                                 dock_mode = layout_data.get("dock_mode", "strip")
+                                expand_size = layout_data.get("expand_size", None)
                             elif "position" in local_note_data and "size" in local_note_data:
                                 # 旧格式
                                 position = QPoint(local_note_data["position"][0], local_note_data["position"][1])
@@ -800,6 +810,8 @@ class StickyNoteManager(QObject):
                         note.is_expanded = is_expanded
                         note.edge_snapped = edge_snapped
                         note.dock_mode = dock_mode
+                        if expand_size:
+                            note.expand_windown_size = expand_size
                         # 卷帘折叠是临时状态，加载时一律展开
                         if note.edge_snapped is None and not note.is_expanded:
                             note.is_expanded = True
@@ -1061,18 +1073,13 @@ class StickyNote(QMainWindow):
 
         central_layout.addWidget(self.content_stack)
 
-        # 底行：右下角调整大小手柄（无边框窗口没有原生拉伸边）
-        bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(0, 0, 0, 0)
-        bottom_row.addStretch()
-        self.size_grip = QSizeGrip(self)
-        self.size_grip.setToolTip("拖动调整大小")
-        self.size_grip.installEventFilter(self)
-        bottom_row.addWidget(self.size_grip, 0, Qt.AlignBottom | Qt.AlignRight)
-        central_layout.addLayout(bottom_row)
-
         self.setCentralWidget(self.main_widget)
         self.resize(self.expand_windown_size[0], self.expand_windown_size[1])
+
+        # 调整大小手柄：悬浮在卡片右下角，不占布局空间（底部不再占文字区域）
+        self.size_grip = QSizeGrip(self.central_widget)
+        self.size_grip.setToolTip("拖动调整大小")
+        self.size_grip.installEventFilter(self)
 
         # 自绘柔和阴影（仅浮动状态启用，吸附时关闭并贴合屏幕边缘）
         self.shadow_effect = QGraphicsDropShadowEffect(self)
@@ -1080,7 +1087,9 @@ class StickyNote(QMainWindow):
         self.shadow_effect.setOffset(0, 3)
         self.shadow_effect.setColor(QColor(0, 0, 0, 50))
         self.central_widget.setGraphicsEffect(self.shadow_effect)
+        self.size_grip.raise_()
         self._update_chrome()
+        self._reposition_grip()
 
     def create_title_bar(self):
         title_bar = QWidget()
@@ -1090,19 +1099,20 @@ class StickyNote(QMainWindow):
                 background: rgba(0, 0, 0, 0.05);
                 border-top-left-radius: 12px;
                 border-top-right-radius: 12px;
-                padding: 5px;
+                padding: 1px;
             }
         """
         )
 
         layout = QHBoxLayout(title_bar)
-        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setContentsMargins(3, 1, 3, 1)
+        layout.setSpacing(2)
 
         btn_style = """
             QPushButton {
                 background: transparent;
                 border: none;
-                border-radius: 12px;
+                border-radius: 10px;
             }
             QPushButton:hover {
                 background: rgba(0, 0, 0, 0.1);
@@ -1114,7 +1124,7 @@ class StickyNote(QMainWindow):
 
         # Toggle preview button
         self.preview_btn = QPushButton()
-        self.preview_btn.setFixedSize(24, 24)
+        self.preview_btn.setFixedSize(20, 20)
         self.preview_btn.setStyleSheet(btn_style)
         self.preview_btn.setCheckable(True)
         self.preview_btn.toggled.connect(self.toggle_preview)
@@ -1122,7 +1132,7 @@ class StickyNote(QMainWindow):
 
         # Color picker button
         self.color_btn = QPushButton()
-        self.color_btn.setFixedSize(24, 24)
+        self.color_btn.setFixedSize(20, 20)
         self.color_btn.setStyleSheet(btn_style)
         self.color_btn.setToolTip("更换颜色（预设色卡 / 自定义）")
         self.color_btn.clicked.connect(self.choose_color)
@@ -1135,7 +1145,7 @@ class StickyNote(QMainWindow):
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(30, 100)
         self.opacity_slider.setValue(85)
-        self.opacity_slider.setFixedWidth(80)
+        self.opacity_slider.setFixedWidth(56)
         self.opacity_slider.setToolTip("拖动调整便签透明度")
         self.opacity_slider.valueChanged.connect(self.set_opacity)
         layout.addWidget(self.opacity_slider)
@@ -1144,7 +1154,7 @@ class StickyNote(QMainWindow):
 
         # Close button
         self.close_btn = QPushButton()
-        self.close_btn.setFixedSize(24, 24)
+        self.close_btn.setFixedSize(20, 20)
         self.close_btn.setStyleSheet(btn_style)
         self.close_btn.setToolTip("删除便签")
         self.close_btn.clicked.connect(self.close)
@@ -1677,7 +1687,7 @@ class StickyNote(QMainWindow):
         lum = 0.299 * self.color.red() + 0.587 * self.color.green() + 0.114 * self.color.blue()
         return "#f5f5f5" if lum < 128 else "#333"
 
-    def _editor_style(self, padding=10):
+    def _editor_style(self, padding=6):
         return f"""
             QTextEdit {{
                 background: transparent;
@@ -1696,11 +1706,11 @@ class StickyNote(QMainWindow):
     def _refresh_icons(self):
         """按当前底色和预览状态刷新标题栏图标"""
         color = self._icon_color()
-        self.preview_btn.setIcon(make_icon("edit" if self.show_preview else "preview", color=color))
+        self.preview_btn.setIcon(make_icon("edit" if self.show_preview else "preview", color=color, size=13))
         self.preview_btn.setToolTip("返回编辑" if self.show_preview else "Markdown 预览")
-        self.color_btn.setIcon(make_icon("palette", color=color))
-        self.close_btn.setIcon(make_icon("close", color=color))
-        self.opacity_icon.setPixmap(make_icon("opacity", color=color).pixmap(16, 16))
+        self.color_btn.setIcon(make_icon("palette", color=color, size=13))
+        self.close_btn.setIcon(make_icon("close", color=color, size=13))
+        self.opacity_icon.setPixmap(make_icon("opacity", color=color, size=13).pixmap(13, 13))
 
     def _update_chrome(self):
         """阴影、调整柄与卡片圆角随状态更新。
@@ -1783,6 +1793,8 @@ class StickyNote(QMainWindow):
         super().showEvent(event)
         self.raise_()
         self.activateWindow()
+        # 布局就绪后把手柄定位到卡片右下角（初始化时控件还是默认尺寸，定位不准）
+        self._reposition_grip()
 
         # macOS: 设置窗口级别以在所有桌面显示
         # 仅 cocoa 平台插件下 winId 才是真实 NSView 指针（offscreen 等插件下解引用会崩溃）
@@ -1915,8 +1927,27 @@ class StickyNote(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._reposition_grip()
+        # 手柄拖动改的尺寸要记住，折叠/展开后按此恢复
+        if self._grip_resizing and self.is_expanded:
+            self.expand_windown_size = [self.width(), self.height()]
         if not self.manager._loading:
             self.manager.save_notes()
+
+    def _reposition_grip(self):
+        """把调整手柄悬浮到卡片右下角（不占布局空间）"""
+        if not hasattr(self, "size_grip"):
+            return
+        # 手柄先收缩到 sizeHint（默认 100x30 是未布局时的占位尺寸），再按卡片角点定位
+        hint = self.size_grip.sizeHint()
+        if hint.isValid() and self.size_grip.size() != hint:
+            self.size_grip.resize(hint)
+        corner = self.central_widget.rect().bottomRight()
+        p = self.central_widget.mapTo(self.size_grip.parentWidget(), corner)
+        self.size_grip.move(
+            p.x() - self.size_grip.width() - 3,
+            p.y() - self.size_grip.height() - 3,
+        )
 
     def close_without_confirmation(self):
         """直接关闭便签，不显示确认窗口"""
