@@ -1339,6 +1339,8 @@ class StickyNote(QMainWindow):
         if not screen:
             return
 
+        # 取消可能正在运行的折叠动画（否则它会把窗口缩回细条，产生僵尸状态）
+        self._stop_geometry_animation()
         screen_geo = screen.geometry()
         current_geo = self.geometry()
 
@@ -1531,6 +1533,7 @@ class StickyNote(QMainWindow):
         if self.content_stack.isHidden():
             self.content_stack.show()
         self.set_content(self.full_content)
+        self._stop_geometry_animation()  # 取消可能进行中的折叠动画
         self.setGeometry(geometry)
         self.setToolTip("")
         self.toggle_preview(self.show_preview, change_default=False)
@@ -1701,8 +1704,16 @@ class StickyNote(QMainWindow):
         self.size_grip.setVisible(self.is_expanded)
         self.central_widget.setStyleSheet(self._card_style())
 
+    def _stop_geometry_animation(self):
+        """停止进行中的几何动画（动画与状态切换竞争会产生"标记展开、实际细条"的僵尸状态）"""
+        anim = getattr(self, "_geometry_anim", None)
+        if anim is not None:
+            anim.stop()
+            self._geometry_anim = None
+
     def _animate_to(self, target_geo):
         """滑动动画过渡到目标位置尺寸"""
+        self._stop_geometry_animation()  # 先取消旧动画，防止与新状态竞争
         anim = QPropertyAnimation(self, b"geometry", self)
         anim.setDuration(180)
         anim.setEasingCurve(QEasingCurve.OutQuad)
