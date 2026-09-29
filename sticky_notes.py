@@ -972,6 +972,11 @@ class StickyNote(QMainWindow):
         self._drag_watch_timer = QTimer(self)
         self._drag_watch_timer.setInterval(80)
         self._drag_watch_timer.timeout.connect(self._check_native_drag_end)
+        # 几何动画长期持有（不要用 DeleteWhenStopped：自删除后留下悬空引用，
+        # 下次 stop() 直接 RuntimeError 崩退）
+        self._geometry_anim = QPropertyAnimation(self, b"geometry", self)
+        self._geometry_anim.setDuration(180)
+        self._geometry_anim.setEasingCurve(QEasingCurve.OutQuad)
 
         self.init_ui()
         self.setup_shortcuts()
@@ -1706,21 +1711,15 @@ class StickyNote(QMainWindow):
 
     def _stop_geometry_animation(self):
         """停止进行中的几何动画（动画与状态切换竞争会产生"标记展开、实际细条"的僵尸状态）"""
-        anim = getattr(self, "_geometry_anim", None)
-        if anim is not None:
-            anim.stop()
-            self._geometry_anim = None
+        self._geometry_anim.stop()
 
     def _animate_to(self, target_geo):
         """滑动动画过渡到目标位置尺寸"""
-        self._stop_geometry_animation()  # 先取消旧动画，防止与新状态竞争
-        anim = QPropertyAnimation(self, b"geometry", self)
-        anim.setDuration(180)
-        anim.setEasingCurve(QEasingCurve.OutQuad)
+        anim = self._geometry_anim
+        anim.stop()  # 先停止进行中的动画，防止与新状态竞争
         anim.setStartValue(self.geometry())
         anim.setEndValue(target_geo)
-        anim.start(QPropertyAnimation.DeleteWhenStopped)
-        self._geometry_anim = anim
+        anim.start()
 
     def choose_color(self):
         """预设色卡一键换色，也可打开自定义选色"""
