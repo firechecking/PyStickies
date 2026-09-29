@@ -375,9 +375,37 @@ class StickyNoteManager(QObject):
             self.gist_worker.last_known_updated_at = self.gist_updated_at
             self.gist_worker.load_from_gist()
     
-    def _validate_screen_position(self, position, size, screen_index):
-        """保持原始位置和尺寸，不做调整"""
-        return position, screen_index, size
+    def _sanitize_layout(self, position, size, edge_snapped, is_expanded):
+        """加载时校正布局：坐标落到有效屏幕、异常尺寸恢复默认。
+        （显示器配置变化会让旧坐标落在所有屏幕之外；异常状态下尺寸可能被钳制成 20x30）"""
+        if not isinstance(size, list) or len(size) != 2:
+            size = [300, 200]
+        w, h = size
+        if is_expanded and (w < 100 or h < 60):
+            # 展开便签尺寸异常（正常 300x200），恢复默认
+            w, h = 300, 200
+
+        # 窗口中心不在任何屏幕上 → 移到当前屏幕（吸附态贴到对应边缘，保证
+        # 后续 collapse 重放的 screenAt(中心) 能找到屏幕）
+        cx, cy = position.x() + w // 2, position.y() + h // 2
+        on_screen = any(
+            s.geometry().contains(QPoint(cx, cy)) for s in QApplication.screens()
+        )
+        if not on_screen:
+            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+            geo = screen.geometry()
+            if edge_snapped == "left":
+                position = QPoint(geo.left() + 1, geo.top() + 100)
+            elif edge_snapped == "right":
+                position = QPoint(geo.right() - w, geo.top() + 100)
+            elif edge_snapped == "top":
+                position = QPoint(geo.left() + 100, geo.top() + 1)
+            elif edge_snapped == "bottom":
+                position = QPoint(geo.left() + 100, geo.bottom() - h)
+            else:
+                position = QPoint(geo.left() + 100, geo.top() + 100)
+
+        return position, [w, h]
 
     def _load_notes_from_data(self, notes_data):
         """Internal method to load notes from data dict - 支持新旧格式和Gist数据"""
@@ -466,6 +494,9 @@ class StickyNoteManager(QObject):
                     is_expanded = True
                     edge_snapped = None
                     dock_mode = "strip"
+
+                # 校正布局：坐标落到有效屏幕、异常尺寸恢复默认
+                position, size = self._sanitize_layout(position, size, edge_snapped, is_expanded)
 
                 # 创建新便签，但不触发任何事件
                 note = self.display_note(
@@ -752,7 +783,10 @@ class StickyNoteManager(QObject):
                             screen_geo = screens[screen_index].geometry()
                             position = QPoint(screen_geo.x() + 100, screen_geo.y() + 100)
                             size = [300, 200]
-                        
+
+                        # 校正布局：坐标落到有效屏幕、异常尺寸恢复默认
+                        position, size = self._sanitize_layout(position, size, edge_snapped, is_expanded)
+
                         # 创建新便签
                         note = self.display_note(
                             note_id=note_id,
