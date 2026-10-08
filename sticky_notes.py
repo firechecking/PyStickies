@@ -1408,49 +1408,16 @@ class StickyNote(QMainWindow):
         if not screen:
             return self.geometry()
 
-        screen_geo = screen.geometry()
-        current_geo = self.geometry()
-
+        # 触发区 = 可见卡片本身（窗口四周含边距的部分不算）：
+        # 横向纵向都随便签内容自适应（长便签整条可触发），又不会提前触发
+        card = self.geometry().adjusted(
+            CHROME_MARGIN, CHROME_MARGIN, -CHROME_MARGIN, -CHROME_MARGIN
+        )
         if self.dock_mode == "sliver":
-            # 隐藏态色块：触发区贴合可见色块（仅几像素余量），
-            # 避免鼠标只是靠近屏幕边缘就误触展开
+            # 隐藏态色块只有几像素，给少许余量方便瞄准
             slack = 4
-            card = current_geo.adjusted(
-                CHROME_MARGIN, CHROME_MARGIN, -CHROME_MARGIN, -CHROME_MARGIN
-            )
             return card.adjusted(-slack, -slack, slack, slack)
-
-        # Create larger trigger zone when collapsed
-        trigger_width = 50  # Wider trigger zone
-        trigger_height = 50  # Taller trigger zone
-
-        # 感应区跟随细条实际尺寸自适应（长便签整个条面都可触发），保底 50px
-        if self.edge_snapped == "left":
-            zone_w = max(trigger_width, current_geo.width())
-            return QRect(
-                screen_geo.left(), current_geo.y(), zone_w, current_geo.height()
-            )
-        elif self.edge_snapped == "right":
-            zone_w = max(trigger_width, current_geo.width())
-            return QRect(
-                screen_geo.right() - zone_w,
-                current_geo.y(),
-                zone_w,
-                current_geo.height(),
-            )
-        elif self.edge_snapped == "top":
-            return QRect(
-                current_geo.x(), screen_geo.top(), current_geo.width(),
-                max(trigger_height, current_geo.height()),
-            )
-        elif self.edge_snapped == "bottom":
-            zone_h = max(trigger_height, current_geo.height())
-            return QRect(
-                current_geo.x(),
-                screen_geo.bottom() - zone_h,
-                current_geo.width(),
-                zone_h,
-            )
+        return card
 
         return self.geometry()
 
