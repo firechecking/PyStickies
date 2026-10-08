@@ -1411,6 +1411,15 @@ class StickyNote(QMainWindow):
         screen_geo = screen.geometry()
         current_geo = self.geometry()
 
+        if self.dock_mode == "sliver":
+            # 隐藏态色块：触发区贴合可见色块（仅几像素余量），
+            # 避免鼠标只是靠近屏幕边缘就误触展开
+            slack = 4
+            card = current_geo.adjusted(
+                CHROME_MARGIN, CHROME_MARGIN, -CHROME_MARGIN, -CHROME_MARGIN
+            )
+            return card.adjusted(-slack, -slack, slack, slack)
+
         # Create larger trigger zone when collapsed
         trigger_width = 50  # Wider trigger zone
         trigger_height = 50  # Taller trigger zone
