@@ -1424,27 +1424,32 @@ class StickyNote(QMainWindow):
         trigger_width = 50  # Wider trigger zone
         trigger_height = 50  # Taller trigger zone
 
+        # 感应区跟随细条实际尺寸自适应（长便签整个条面都可触发），保底 50px
         if self.edge_snapped == "left":
+            zone_w = max(trigger_width, current_geo.width())
             return QRect(
-                screen_geo.left(), current_geo.y(), trigger_width, current_geo.height()
+                screen_geo.left(), current_geo.y(), zone_w, current_geo.height()
             )
         elif self.edge_snapped == "right":
+            zone_w = max(trigger_width, current_geo.width())
             return QRect(
-                screen_geo.right() - trigger_width,
+                screen_geo.right() - zone_w,
                 current_geo.y(),
-                trigger_width,
+                zone_w,
                 current_geo.height(),
             )
         elif self.edge_snapped == "top":
             return QRect(
-                current_geo.x(), screen_geo.top(), current_geo.width(), trigger_height
+                current_geo.x(), screen_geo.top(), current_geo.width(),
+                max(trigger_height, current_geo.height()),
             )
         elif self.edge_snapped == "bottom":
+            zone_h = max(trigger_height, current_geo.height())
             return QRect(
                 current_geo.x(),
-                screen_geo.bottom() - trigger_height,
+                screen_geo.bottom() - zone_h,
                 current_geo.width(),
-                trigger_height,
+                zone_h,
             )
 
         return self.geometry()
