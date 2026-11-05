@@ -58,7 +58,7 @@ except ImportError:
 try:
     import objc
     from AppKit import NSApplicationActivationPolicyAccessory
-    from Cocoa import NSApplication, NSApp, NSWindowCollectionBehaviorCanJoinAllSpaces
+    from Cocoa import NSApplication, NSApp, NSWindowCollectionBehaviorCanJoinAllSpaces, NSWindowCollectionBehaviorTransient
 
     MACOS_AVAILABLE = True
 except ImportError:
@@ -1871,9 +1871,10 @@ class StickyNote(QMainWindow):
                 # 不要手动 setLevel_：NSFloatingWindowLevel+1(=4) 低于菜单栏层级(8)，
                 # 窗口会被钳制在菜单栏以下——外接屏在上方时跨屏拖动被卡死
                 # （实测窗口顶边被钳在 y=32 菜单栏线）。置顶交给 Qt 的 WindowStaysOnTopHint（层级 8）。
-                # 确保窗口在所有空间都可见
+                # 确保窗口在所有空间都可见；Transient 让调度中心和 Cmd+Tab 不显示便签
                 behavior = ns_window.collectionBehavior()
                 behavior |= NSWindowCollectionBehaviorCanJoinAllSpaces
+                behavior |= NSWindowCollectionBehaviorTransient
                 ns_window.setCollectionBehavior_(behavior)
             except Exception as e:
                 print(f"macOS window level setup failed: {e}")
