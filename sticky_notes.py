@@ -1337,7 +1337,7 @@ class StickyNote(QMainWindow):
             return
 
         screen_geo = screen.geometry()
-        margin = 20  # 边缘吸附的触发距离（原来 50px 太大，未靠近就被吸走）
+        margin = 5  # 边缘吸附的触发距离（20px 仍偏大，收窄到 5px 精准吸附）
 
         x, y = self.x(), self.y()
         width, height = self.width(), self.height()
