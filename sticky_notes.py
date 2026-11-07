@@ -1337,7 +1337,7 @@ class StickyNote(QMainWindow):
             return
 
         screen_geo = screen.geometry()
-        margin = 50  # Increased from 20px to 50px for easier docking
+        margin = 20  # 边缘吸附的触发距离（原来 50px 太大，未靠近就被吸走）
 
         x, y = self.x(), self.y()
         width, height = self.width(), self.height()
